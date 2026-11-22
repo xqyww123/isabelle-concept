@@ -723,15 +723,13 @@ fun gives_directly _ _ (_, _, Given_Leaf _) _ = true
   | gives_directly thy p (path, _, Given_Node _) j =
       is_prefix (op =) (filter_out (fn seg => seg = "super") (map #1 path)) (leaf_path thy p j);
 
-(*no leaf of p given twice, among the leaves that count for a clause; owner names p as the user
-  named it*)
-fun check_twice thy p owner counts entries =
+(*no leaf of p given twice in a header; owner names p as the user named it*)
+fun check_twice thy p owner entries =
   let
     (*a leaf with the clause giving it: its index, its path, the leaf's path below it*)
     val assigned =
-      flat (map_index (fn (i, entry as (path, _, g)) =>
-        given_leaves thy g |> map_filter (fn (j, sub) =>
-          if counts entry j then SOME (j, (i, path, sub)) else NONE)) entries);
+      flat (map_index (fn (i, (path, _, g)) =>
+        map (fn (j, sub) => (j, (i, path, sub))) (given_leaves thy g)) entries);
   in
     assigned |> List.app (fn (j, _) =>
       (case filter (fn (j', _) => j' = j) assigned of
@@ -760,10 +758,8 @@ fun node_leaves thy (p as (_, name), more) : flat_leaf list =
 
 (*resolve the where clauses in the node of p with the more slot of type more; owner names the
   node as the user named it; a clause may not reach a leaf that the parent's where clause
-  already gave, directly or through a node.  In a header no leaf is given twice; in an instance
-  (direct) no leaf is given twice directly and no path is written twice, the other values of a
-  leaf being compared*)
-fun resolve_entries thy (p, more) no_field owner direct where_ =
+  already gave, directly or through a node*)
+fun resolve_entries thy (p, more) no_field owner where_ =
   let
     val ident = map Leaf (0 upto length (node_leaves thy (p, more)) - 1);
     fun already_given path pos (d, t) =
@@ -784,52 +780,49 @@ fun resolve_entries thy (p, more) no_field owner direct where_ =
               Given_Node (p', more',
                 map_index (fn (k, s) => (leaf (fn () => leaf_path thy p' k) s, k)) slots, views)))
       end;
-    val entries = map entry where_;
-    val _ =
-      if direct then
-        (case duplicates (eq_list (op =) o apply2 (map #1)) (map #1 where_) of
-          path :: _ =>
-            error ("The field " ^ implode_path (map #1 path) ^ " of " ^ owner ^
-              " is specified twice" ^ Position.here (#2 (List.last path)))
-        | [] => ())
-      else ();
-    val _ = check_twice thy p owner (if direct then gives_directly thy p else K (K true)) entries;
-  in entries end;
+  in map entry where_ end;
+
+(*read the right-hand side of the where clause at path against the type T, which the messages
+  show as shown_T; part: the concept whose part the clause stands for, when its path ends in
+  super; owner names the node as the user named it*)
+fun read_against ctxt owner path (T, shown_T) part rhs =
+  (Syntax.parse_term ctxt rhs |> Type.constraint T |> Syntax.check_term ctxt)
+    handle ERROR msg =>
+      let
+        val u = Syntax.read_term ctxt rhs handle ERROR _ => error msg;
+        val field =
+          implode_path (map #1 path) ^ Position.here (#2 (List.last path)) ^ " of " ^ owner;
+        val shown = quote (Syntax.string_of_typ ctxt shown_T);
+        val value =
+          quote (Syntax.string_of_term ctxt u) ^ " has type " ^
+            quote (Syntax.string_of_typ ctxt (fastype_of u));
+      in
+        (case part of
+          SOME q =>
+            error (field ^ " stands for its " ^ Long_Name.base_name q ^ " part, of type " ^
+              shown ^ ", but the given value " ^ value)
+        | NONE =>
+            error ("The field " ^ field ^ " expects type " ^ shown ^ ", but the given value " ^
+              value))
+      end;
 
 (*read the right-hand side of a where clause in the node of p with the more slot of type more,
   against the type of what it gives: a leaf; a node, with any extension when the type of its
   more slot is not fixed (super)*)
 fun read_given thy ctxt (p, more) owner (path, rhs, given) =
   let
-    val pos = #2 (List.last path);
-    val path_s = implode_path (map #1 path);
-    val (T, show_T) =
+    val types =
       (case given of
         Given_Leaf j => let val {typ, ...} = nth (node_leaves thy (p, more)) j in (typ, typ) end
       | Given_Node (p' as (Ts, _), NONE, _, _) =>
           (scheme_type thy p' dummyT,
             scheme_type thy p' (TFree (more_var (map #1 (fold Term.add_tfreesT Ts [])))))
       | Given_Node (p', SOME more', _, _) => let val U = scheme_type thy p' more' in (U, U) end);
-  in
-    (Syntax.parse_term ctxt rhs |> Type.constraint T |> Syntax.check_term ctxt)
-      handle ERROR msg =>
-        let
-          val u = Syntax.read_term ctxt rhs handle ERROR _ => error msg;
-          val shown = quote (Syntax.string_of_typ ctxt show_T);
-          val value =
-            quote (Syntax.string_of_term ctxt u) ^ " has type " ^
-              quote (Syntax.string_of_typ ctxt (fastype_of u));
-        in
-          (case (given, #1 (List.last path)) of
-            (Given_Node (p', _, _, _), "super") =>
-              error (path_s ^ Position.here pos ^ " of " ^ owner ^ " stands for its " ^
-                Long_Name.base_name (#2 p') ^ " part, of type " ^ shown ^
-                ", but the given value " ^ value)
-          | _ =>
-              error ("The field " ^ path_s ^ Position.here pos ^ " of " ^ owner ^
-                " expects type " ^ shown ^ ", but the given value " ^ value))
-        end
-  end;
+    val part =
+      (case (given, #1 (List.last path)) of
+        (Given_Node ((_, q), _, _, _), "super") => SOME q
+      | _ => NONE);
+  in read_against ctxt owner path types part rhs end;
 
 (*the right-hand side of the where clause naming field (quoted, with its position) uses x, which
   nothing defines*)
@@ -1070,9 +1063,9 @@ val cache =
   Synchronized.var "Concept_Type.cache"
     (0, Termtab.empty: thm Unsynchronized.weak_ref Termtab.table);
 
-(*the finished ancestor theory that has every constant and type constructor of t and in which
-  the constants of t have well-sorted types, if any: what is proved there serves all theories
-  that import it*)
+(*the finished ancestor theory that has every constant and type constructor of t, in which t
+  certifies and its constants have well-sorted types, if any: what is proved there serves all
+  theories that import it*)
 fun home thy t =
   let
     val names =
@@ -1082,8 +1075,10 @@ fun home thy t =
         (Term.fold_types add_tycos t [])
       |> distinct (op =);
     val thys = map (try (Context.get_theory {long = true} thy)) names;
-    (*a class or an arity of the types of t may be younger than the theory*)
+    (*a class or an arity of the types of t may be younger than the theory: certification finds
+      a class the theory lacks, the instance test a sort that a type does not have there*)
     fun well_sorted thy' =
+      can (Sign.certify_term thy') t andalso
       Term.fold_aterms (fn Const (c, T) => (fn ok =>
           ok andalso Sign.typ_instance thy' (T, Sign.the_const_type thy' c))
         | _ => I) t true;
@@ -1163,12 +1158,14 @@ fun stored_value ctxt value ct =
     else Option.map (at_cterm ct) (cached ctxt key prove)
   end;
 
-(*the case constant of a datatype with one constructor: the constructor, the case theorem*)
+(*the case constant of a datatype with one constructor: the constructor and the case theorem,
+  both of the registration of the datatype that has this case constant*)
 fun single_case ctxt c =
   (case Case_Translation.lookup_by_case ctxt c of
     SOME (_, [ctr]) =>
       (case Ctr_Sugar.ctr_sugar_of ctxt (dest_Type_name (body_type (fastype_of ctr))) of
-        SOME {case_thms = [th], ...} => SOME (ctr, th)
+        SOME {casex = Const (c', _), ctrs = [ctr'], case_thms = [th], ...} =>
+          if c' = c then SOME (ctr', th) else NONE
       | _ => NONE)
   | _ => NONE);
 
@@ -1222,8 +1219,10 @@ fun select ctxt value ct =
     then SOME th else NONE);
 
 (*a value of a field as it is compared with another: rewritten by the selector Simpset, with
-  nothing assumed; beta-eta normal*)
+  nothing assumed, then once more with the values that begin with a pattern, so that values
+  the selector Simpset makes equal stay equal; beta-eta normal*)
 fun value_conv ctxt =
+  Simplifier.rewrite (put_selector_simpset ctxt) then_conv
   Simplifier.rewrite (put_selector_simpset (Config.put pattern_values true ctxt)) then_conv
   Drule.beta_eta_conversion;
 
@@ -1395,22 +1394,40 @@ fun truncate_eq_of_fields thy L fields =
   let val truncated = #concept (the_laws thy L) RS @{thm iffD2}
   in base_equality thy OF [truncated, truncated, fields] end;
 
-(*a theorem instantiated so that the subterm of its proposition that select gives becomes obj;
-  the variables of obj are kept apart.  The matching is on terms: an obj that is ill-typed or
-  does not fit fails with Pattern.MATCH*)
+(*a term under an instantiation got by matching; a term instantiated before can be
+  instantiated again*)
+fun instantiated ((tyenv, tenv): Type.tyenv * Envir.tenv) =
+  Envir.norm_term (Envir.Envir {maxidx = ~1, tenv = tenv, tyenv = tyenv});
+
+(*the pattern has none of the variables that env instantiates*)
+fun matches thy pair env =
+  SOME (Pattern.match thy pair env) handle Pattern.MATCH => NONE | Pattern.Pattern => NONE;
+
+(*the instantiation that makes the subterm of the proposition of th that select gives obj, with
+  th, its variables kept apart from those of obj.  The matching is on terms: an obj that is
+  ill-typed or does not fit gives none*)
+fun match_at thy select obj th =
+  let val th' = Thm.incr_indexes (Term.maxidx_of_term obj + 1) th in
+    matches thy (select (Thm.prop_of th'), obj) (Vartab.empty, Vartab.empty)
+    |> Option.map (rpair th')
+  end;
+
+(*th so instantiated; Pattern.MATCH without such an instantiation*)
 fun instantiate_at ctxt select obj th =
-  let
-    val thy = Proof_Context.theory_of ctxt;
-    val th' = Thm.incr_indexes (Term.maxidx_of_term obj + 1) th;
-    val (tyenv, tenv) =
-      Pattern.match thy (select (Thm.prop_of th'), obj) (Vartab.empty, Vartab.empty);
-    val instT =
-      TVars.build (tyenv |> Vartab.fold (fn (xi, (S, T)) =>
-        TVars.add ((xi, S), Thm.ctyp_of ctxt T)));
-    val inst =
-      Vars.build (tenv |> Vartab.fold (fn (xi, (T, u)) =>
-        Vars.add ((xi, Envir.subst_type tyenv T), Thm.cterm_of ctxt u)));
-  in Thm.instantiate (instT, inst) th' end;
+  (case match_at (Proof_Context.theory_of ctxt) select obj th of
+    SOME ((tyenv, tenv), th') =>
+      let
+        val instT =
+          TVars.build (tyenv |> Vartab.fold (fn (xi, (S, T)) =>
+            TVars.add ((xi, S), Thm.ctyp_of ctxt T)));
+        val inst =
+          Vars.build (tenv |> Vartab.fold (fn (xi, (T, u)) =>
+            Vars.add ((xi, Envir.subst_type tyenv T), Thm.cterm_of ctxt u)));
+      in Thm.instantiate (instT, inst) th' end
+  | NONE => raise Pattern.MATCH);
+
+(*instantiate_at will give a theorem*)
+fun fits thy select obj = is_some o match_at thy select obj;
 
 val concl_of = HOLogic.dest_Trueprop o Logic.strip_imp_concl;
 val lhs_of = #1 o HOLogic.dest_eq o concl_of;
@@ -1421,33 +1438,16 @@ val sides_of = HOLogic.mk_prod o HOLogic.dest_eq o concl_of;
 val structure_of = #2 o dest_comb o concl_of;
 val premise_structure_of = #2 o dest_comb o HOLogic.dest_Trueprop o hd o Logic.strip_imp_prems;
 
-(*a term under an instantiation got by matching; a term instantiated before can be
-  instantiated again*)
-fun instantiated ((tyenv, tenv): Type.tyenv * Envir.tenv) =
-  Envir.norm_term (Envir.Envir {maxidx = ~1, tenv = tenv, tyenv = tyenv});
-
-(*the pattern has none of the variables that env instantiates*)
-fun matches thy pair env =
-  SOME (Pattern.match thy pair env) handle Pattern.MATCH => NONE | Pattern.Pattern => NONE;
-
-(*instantiate_at will give a theorem: the same matching, on terms only*)
-fun fits thy select obj th =
-  let val prop = Logic.incr_indexes ([], Term.maxidx_of_term obj + 1) (Thm.prop_of th)
-  in is_some (matches thy (select prop, obj) (Vartab.empty, Vartab.empty)) end;
+(*the u of concept u = H*)
+val hidden_structure = #2 o dest_comb o lhs_of;
 
 (*for an instance or a view u applied to its arguments: its theorem concept (c ?xs) = H, and
   the hidden field of u, which is H at u*)
 fun hidden_field thy u =
   let
     fun at th =
-      let
-        val (lhs, rhs) =
-          HOLogic.dest_eq
-            (concl_of (Logic.incr_indexes ([], Term.maxidx_of_term u + 1) (Thm.prop_of th)));
-      in
-        matches thy (#2 (dest_comb lhs), u) (Vartab.empty, Vartab.empty)
-        |> Option.map (fn env => (th, instantiated env rhs))
-      end;
+      match_at thy hidden_structure u th
+      |> Option.map (fn (env, th') => (th, instantiated env (rhs_of (Thm.prop_of th'))));
   in
     (case dest_head thy u of
       SOME (Instance_Head {concept_eq, ...}, _, _) => at concept_eq
@@ -1456,7 +1456,7 @@ fun hidden_field thy u =
   end;
 
 (*concept u = H from that theorem, H as hidden_field gives it modulo beta*)
-fun hidden_at ctxt u th = instantiate_at ctxt (#2 o dest_comb o lhs_of) u th;
+fun hidden_at ctxt u = instantiate_at ctxt hidden_structure u;
 
 (*concept t, when the hidden field of t is True: t an instance or a view, under truncations*)
 fun concept_holds ctxt t =
@@ -1593,15 +1593,15 @@ structure Congs = Generic_Data
 fun rule_arity _ _ (Congruence th) = length (#2 (strip_comb (lhs_of (Thm.prop_of th))))
   | rule_arity thy c (Commutes _) = length (binder_types (Sign.the_const_type thy c));
 
-(*the rule in use: a theorem in the theory of the context; the definition of the mark Commutes
-  stays without its theory, for the proofs in the home of its constant*)
+(*the rule in use, its theorem in the theory of the context*)
 fun truncate_cong context (c, i) =
   Symtab.lookup (Congs.get context) c
   |> Option.mapPartial (fn tab => Inttab.lookup tab i)
   |> Option.mapPartial (fn es: cong_entry list =>
     (case sort (cong_ord o apply2 #rule) es of
       {rule = Congruence th, ...} :: _ => SOME (Congruence (Thm.transfer'' context th))
-    | e :: _ => SOME (#rule e)
+    | {rule = Commutes {owner, def}, ...} :: _ =>
+        SOME (Commutes {owner = owner, def = Thm.transfer'' context def})
     | [] => NONE));
 
 (*the rule in use for the constant c applied to n arguments, at the position i: a rule speaks
@@ -1685,9 +1685,9 @@ fun derive_cong ctxt names {const = f, def, position = i} =
 fun derive_truncate_cong ctxt = derive_cong ctxt NONE;
 
 (*c xs[i := P.truncate x] = P.truncate (c xs) as a meta equation, for variables xs of the types
-  of args, x at the position i, where the constant c with the definition def has the mark
-  Commutes*)
-fun commuting ctxt def P c i args =
+  of args, x at the position i, where the constant c has the mark Commutes: proved from the
+  definition in the mark as the theory of the proof has it*)
+fun commuting ctxt P c i args =
   let
     val truncate = mk_truncate (Proof_Context.theory_of ctxt) P;
     val xs = map_index (fn (k, u) => Var (("x", k), fastype_of u)) args;
@@ -1696,13 +1696,16 @@ fun commuting ctxt def P c i args =
     val g = Const (c, map fastype_of xs ---> fastype_of x);
     val g' = Const (c, map fastype_of xs' ---> fastype_of (truncate x));
     fun prove ctxt' =
-      prove_cong_meta ctxt' (is_own (Proof_Context.theory_of ctxt') c) (Thm.transfer' ctxt' def)
-        (list_comb (g', xs')) (truncate (list_comb (g, xs)));
+      (case truncate_cong (Context.Proof ctxt') (c, i) of
+        SOME (Commutes {def, ...}) =>
+          prove_cong_meta ctxt' (is_own (Proof_Context.theory_of ctxt') c) def
+            (list_comb (g', xs')) (truncate (list_comb (g, xs)))
+      | _ => NONE);
   in cached ctxt (list_comb (g', xs')) prove end;
 
 (*c args[i := P.truncate u] = P.truncate (c args), where args has u at the position i*)
-fun commuting_at ctxt def P c i args =
-  commuting ctxt def P c i args |> Option.map (fn th =>
+fun commuting_at ctxt P c i args =
+  commuting ctxt P c i args |> Option.map (fn th =>
     let
       val inst =
         map_index (fn (k, u) => ((("x", k), fastype_of u), Thm.cterm_of ctxt u)) args;
@@ -1746,8 +1749,8 @@ fun cong_proc ctxt ct =
               end
               (*a rule for other arguments than those of t*)
               handle Pattern.MATCH => NONE)
-          | Commutes {def, ...} =>
-              Option.map (at_cterm ct) (commuting ctxt def P (dest_Const_name f) i args'))
+          | Commutes _ =>
+              Option.map (at_cterm ct) (commuting ctxt P (dest_Const_name f) i args'))
         end);
   in
     (case f of
@@ -2161,13 +2164,13 @@ fun named_cong context (s, n) =
   in
     (case truncate_cong context (c, i) of
       SOME (Congruence th) => th
-    | SOME (Commutes {owner, def}) =>
+    | SOME (Commutes {owner, ...}) =>
         let
           val params =
             Option.map (map (#1 o dest_Free) o #params) (get_instance_entry thy c);
           val xs = map Free (arg_names params (length Ts) ~~ Ts);
         in
-          (case commuting_at ctxt def owner c i xs of
+          (case commuting_at ctxt owner c i xs of
             SOME th => Drule.export_without_context th
           | NONE => none ())
         end
@@ -2343,6 +2346,14 @@ fun replaced u k z =
   let val (f, xs) = strip_comb u; val xs' = nth_map k (K z) xs
   in list_comb (Const (dest_Const_name f, map fastype_of xs' ---> fastype_of u), xs') end;
 
+(*x with the arguments ys at the positions ks: what the proof that joins x to a term with the
+  arguments ys has made of x when it has done these positions*)
+fun joined_so_far x ys ks = fold (fn k => fn u => replaced u k (nth ys k)) ks x;
+
+(*the two sides that a rule at k is matched against*)
+fun rule_sides x ys ks k =
+  let val u = joined_so_far x ys ks in HOLogic.mk_prod (u, replaced u k (nth ys k)) end;
+
 (*L.truncate a = L.truncate b under an instantiation of the variables of a that extends env: the
   first terms on the two walks that match, by the number of steps; else the ends of the walks
   joined at their arguments*)
@@ -2367,7 +2378,8 @@ fun connect ctxt L (a, b) env =
         ~1 => length nodes
       | i => i);
     fun joined (i, j) =
-      join ctxt (SOME L) (nth ls i, nth rs j) env |> Option.map (apsnd (level i j));
+      join ctxt (SOME L) (nth ls i, nth rs j) env
+      |> Option.map (fn (env', args, moved) => (env', level i j (Joined (args, moved))));
   in
     (case get_first (fn (i, j) =>
         Option.map (rpair (level i j Same)) (matches thy (nth ls i, nth rs j) env)) pairs of
@@ -2378,9 +2390,11 @@ fun connect ctxt L (a, b) env =
   end
 
 (*two terms with the same head joined at their arguments, under an instantiation that extends
-  env; layer: an equation between their truncations at this layer will do, so that at one
-  position the truncation may move out of both.  What is accepted here, the proof can build: a
-  rule is taken where it fits, a mark Commutes where its equations are derived*)
+  env: the instantiation, what joins the arguments that differ, and the position where the
+  truncation moves out of both; layer: an equation between their truncations at this layer will
+  do, so that there may be such a position.  What is accepted here, the proof can build: a rule
+  is taken where it fits the term that the proof has then, a mark Commutes where its equations
+  are derived*)
 and join ctxt layer (x, y) env =
   (case (strip_comb x, strip_comb y) of
     ((Const (c, _), xs), (Const (d, _), ys)) =>
@@ -2388,19 +2402,12 @@ and join ctxt layer (x, y) env =
       else
         let
           val thy = Proof_Context.theory_of ctxt;
-          (*what the proof has made of x when it comes to the position k: the arguments of y
-            before k*)
-          fun current (env: Type.tyenv * Envir.tenv) k =
-            let val args = take k ys @ map (instantiated env) (drop k xs) in
-              list_comb
-                (Const (c, map fastype_of args ---> Envir.norm_type (#1 env) (fastype_of x)), args)
-            end;
           fun arg (k, (x_k0, y_k)) (SOME (env, joined, moved)) =
                 let
                   val x_k = instantiated env x_k0;
                   fun whole () =
                     (case join ctxt NONE (x_k, y_k) env of
-                      SOME (env', Joined (args, NONE)) =>
+                      SOME (env', args, NONE) =>
                         SOME (env', (k, Whole (x_k, y_k, args)) :: joined, moved)
                     | _ => NONE);
                 in
@@ -2414,19 +2421,17 @@ and join ctxt layer (x, y) env =
                               (case connect ctxt L (x_k, y_k) env of
                                 SOME (env', lev) =>
                                   (*the types of the two arguments are known now*)
-                                  let val cur = current env' k in
-                                    if fits thy sides_of
-                                      (HOLogic.mk_prod (cur, replaced cur k y_k)) th
-                                    then SOME (env', (k, Rule (th, lev)) :: joined, moved)
-                                    else whole ()
-                                  end
+                                  if fits thy sides_of
+                                    (rule_sides (instantiated env' x) ys (map #1 joined) k) th
+                                  then SOME (env', (k, Rule (th, lev)) :: joined, moved)
+                                  else whole ()
                               | NONE => NONE)
                           | NONE => whole ())
-                      | (SOME (Commutes {owner, def}), SOME L, NONE) =>
+                      | (SOME (Commutes {owner, ...}), SOME L, NONE) =>
                           let
                             val P = if member (op =) (layers_from thy L) owner then L else owner;
                             (*the truncation moved out of c at the arguments of y, with u at k*)
-                            fun out u = commuting ctxt def P c k (nth_map k (K u) ys);
+                            fun out u = commuting ctxt P c k (nth_map k (K u) ys);
                           in
                             (case connect ctxt P (x_k, y_k) env of
                               SOME (env', lev) =>
@@ -2446,7 +2451,7 @@ and join ctxt layer (x, y) env =
             (*no truncation moves out: the two terms become one, so they have one type*)
             (if is_some moved then SOME env'
              else matches_type thy (fastype_of x, fastype_of y) env')
-            |> Option.map (rpair (Joined (rev joined, moved))))
+            |> Option.map (fn env'' => (env'', rev joined, moved)))
         end
   | _ => NONE);
 
@@ -2576,17 +2581,16 @@ fun prove_truncate_eq ctxt inst known (top: level) =
     (*x = x with the arguments ys at the positions joined*)
     fun args_eq x ys joined =
       let
-        fun at (k, arg) th =
+        fun at (k, arg) (ks, th) =
           let
-            val cur = rhs_of (Thm.prop_of th);
             val step =
               (case arg of
-                Whole (x_k, y_k, args) => cong ctxt (replaced cur k) (whole_eq x_k y_k args)
+                Whole (x_k, y_k, args) =>
+                  cong ctxt (replaced (joined_so_far x ys ks) k) (whole_eq x_k y_k args)
               | Rule (rule, lev) =>
-                  instantiate_at ctxt sides_of
-                    (HOLogic.mk_prod (cur, replaced cur k (nth ys k))) rule OF [level_eq lev]);
-          in trans th step end;
-      in fold at joined (refl x) end
+                  instantiate_at ctxt sides_of (rule_sides x ys ks k) rule OF [level_eq lev]);
+          in (k :: ks, trans th step) end;
+      in #2 (fold at joined ([], refl x)) end
 
     and whole_eq x y args = args_eq (inst x) (#2 (strip_comb y)) args
 
@@ -3178,8 +3182,11 @@ fun declare {name = b, args, parent, items} thy0 =
     (* the leaves: the fields, and the leaves of each view not given by its where clauses *)
     val views = map_filter (fn View v => SOME v | Field _ => NONE) items;
     val entriess = views |> map (fn {qualifier, parent = p, more, where_} =>
-      let val q = Binding.name_of qualifier
-      in resolve_entries thy0 (p, more) (no_field_error thy0 cname [q]) q false where_ end);
+      let
+        val q = Binding.name_of qualifier;
+        val entries = resolve_entries thy0 (p, more) (no_field_error thy0 cname [q]) q where_;
+        val _ = check_twice thy0 p q entries;
+      in entries end);
     val storeds = (views ~~ entriess) |> map (fn ({parent = p, more, ...}, entries) =>
       map_index I (node_leaves thy0 (p, more))
       |> filter_out (member (op =) (maps (map #1 o given_leaves thy0 o #3) entries) o #1));
@@ -3398,10 +3405,11 @@ fun add_implication c th thy =
 
 (*the constant x :: params => D, its value built from the where clauses; the layers that its
   source has are taken from the source, whose values must agree with the given ones.  The
-  source is the t of "where super = t", else the member of the family providing the nearest
-  layer of D.  Without define, which the caller passes only when a member of the family owns
-  the layer of D and no super is given, no constant is made: the given values are checked
-  against that member, which is returned*)
+  source is the t of the clause that names a part by super alone with the shortest path, the
+  first written among equal ones; else the member of the family providing the nearest layer of
+  D.  Without define, which the caller passes only when a member of the family owns the layer
+  of D and no super is given, no constant is made: the given values, that of more among them,
+  are checked against that member, which is returned*)
 fun define_instance ctxt
     {family, name = b, define, concept = p_D, params, where_, constraint} thy =
   let
@@ -3411,7 +3419,7 @@ fun define_instance ctxt
     val (more_clauses, clauses) =
       List.partition (fn ([("more", _)], _) => true | _ => false) where_;
     val entries =
-      resolve_entries thy (p_D, HOLogic.unitT) (no_field_error thy dname []) xname true clauses;
+      resolve_entries thy (p_D, HOLogic.unitT) (no_field_error thy dname []) xname clauses;
     val param_names = map (#1 o dest_Free) params;
     val paramTs = map fastype_of params;
     fun field_of path = quote (implode_path (map #1 path)) ^ Position.here (#2 (List.last path));
@@ -3419,39 +3427,7 @@ fun define_instance ctxt
       Term.add_frees t [] |> List.app (fn (x, _) =>
         if member (op =) param_names x then () else undefined_constant field x);
 
-    (* more: given by a where clause, else () *)
-    (*the type variables of the constant are declared: type inference gives a type left open
-      another name*)
-    val ctxt = Variable.declare_typ (paramTs ---> unit_type thy p_D) ctxt;
-    val more =
-      (case more_clauses of
-        [] => HOLogic.unit
-      | [(path, rhs)] =>
-          let val t = Syntax.read_term ctxt rhs
-          in check_params (field_of path) t; t end
-      | _ :: (path, _) :: _ =>
-          error ("The field more of " ^ xname ^ " is specified twice" ^
-            Position.here (#2 (List.last path))));
-    val T = paramTs ---> scheme_type thy p_D (fastype_of more);
-    val ctxt = Variable.declare_typ T ctxt;
-    val _ = more_clauses |> List.app (fn (path, _) => check_determined ctxt T (field_of path) more);
-
-    (*a right-hand side uses only the parameters and determines its types*)
-    fun read_entry (entry as (path, _, _)) =
-      let
-        val t = read_given thy ctxt (p_D, HOLogic.unitT) xname entry;
-        val field = field_of path;
-        val _ = check_params field t;
-        val _ = check_determined ctxt T field t;
-      in (entry, t) end;
-    val read = map read_entry entries;
-    (*the values that the clauses give the leaves, in the order written: with the clause, and
-      whether it gives the leaf directly*)
-    val given =
-      read |> maps (fn (entry as (_, _, g), t) =>
-        map (fn (j, v) => (j, (v, entry, gives_directly thy p_D entry j))) (given_values thy g t));
-
-    (* the source, with the values of the leaves taken from a member of the family *)
+    (* the member of the family that the instance continues *)
     fun part layer p =
       unit_type thy (the (find_first (fn (_, c) => c = layer) (major_chain thy p)));
     fun member_at layer ({member, shown, ...}: provider) =
@@ -3481,56 +3457,125 @@ fun define_instance ctxt
           Sign.typ_match thy (Logic.varifyT_global T_A, T_D) Vartab.empty
           handle Type.TYPE_MATCH => type_error ();
         val m = Envir.subst_term_types tyenv o Logic.varify_types_global;
-        val t = list_comb (m const, params);
         val values = map (instance_subst m src params) (take (leaf_count thy layer) (#values src));
-      in (src, (Family, layer, t), map_index I values) end;
-    val super =
-      get_first (fn ((path, _, Given_Node (p', _, _, _)), t) =>
-          if forall (fn (seg, _) => seg = "super") path
-          then SOME (Super, #owner (the_entry thy (#2 p')), t) else NONE
-        | _ => NONE) read;
-    val provided =
-      (case (super, family) of
-        (NONE, SOME f) =>
-          layers_of thy p_D |> get_first (fn layer =>
-            Option.map (member_at layer) (Symtab.lookup (providers thy f) layer))
+      in
+        {entry = src, source = (Family, layer, list_comb (m const, params)),
+         values = map_index I values, more = instance_subst m src params (#more src)}
+      end;
+    fun continued () =
+      family |> Option.mapPartial (fn f =>
+        layers_of thy p_D |> get_first (fn layer =>
+          Option.map (member_at layer) (Symtab.lookup (providers thy f) layer)));
+    (*without define that member is the result, its more too: it is found before the clauses are
+      read*)
+    val result = if define then NONE else continued ();
+
+    (* more: that of the result; else given by where clauses, the first of them fixing its
+       type; else () *)
+    (*the type variables of the constant are declared: type inference gives a type left open
+      another name*)
+    val ctxt = Variable.declare_typ (paramTs ---> unit_type thy p_D) ctxt;
+    val first_more =
+      (case (result, more_clauses) of
+        (NONE, (_, rhs) :: _) => SOME (Syntax.read_term ctxt rhs)
       | _ => NONE);
-    val inherited = (case provided of SOME (_, _, values) => values | NONE => []);
+    val more =
+      (case (result, first_more) of
+        (SOME {more, ...}, _) => more
+      | (NONE, SOME t) => t
+      | (NONE, NONE) => HOLogic.unit);
+    val moreT = fastype_of more;
+    val T = paramTs ---> scheme_type thy p_D moreT;
+    val ctxt = Variable.declare_typ T ctxt;
+
+    (*a right-hand side uses only the parameters and determines its types*)
+    fun checked (entry as (path, _, _)) t =
+      let val field = field_of path
+      in check_params field t; check_determined ctxt T field t; (entry, t) end;
+    (*the more clauses give the leaf after the leaves: they are read at the type of more, but
+      for the one that fixed it*)
+    val mores =
+      more_clauses |> map_index (fn (i, (path, rhs)) =>
+        checked (path, rhs, Given_Leaf (length leaves_D))
+          (case (i, first_more) of
+            (0, SOME t) => t
+          | _ => read_against ctxt xname path (moreT, moreT) NONE rhs));
+    val read =
+      entries |> map (fn entry =>
+        checked entry (read_given thy ctxt (p_D, HOLogic.unitT) xname entry));
+    (*the values that the clauses give the leaves, in the order written, those of more last:
+      with the clause, and whether it gives the leaf directly*)
+    val given =
+      read @ mores |> maps (fn (entry as (_, _, g), t) =>
+        map (fn (j, v) => (j, (v, entry, gives_directly thy p_D entry j))) (given_values thy g t));
+
+    (* the source, with the values of its leaves *)
+    (*a value read from a node as the messages show it: as it is compared*)
+    fun compared v =
+      Syntax.string_of_term ctxt (Thm.term_of (Thm.rhs_of (value_conv ctxt (Thm.cterm_of ctxt v))));
+    (*of the clauses that name a part by super alone, the one with the shortest path, which
+      covers the most layers, the first written among equal ones*)
+    val super =
+      read |> map_filter (fn ((path, _, g as Given_Node (p', _, _, _)), t) =>
+          if forall (fn (seg, _) => seg = "super") path
+          then
+            SOME (length path,
+              ((Super, #owner (the_entry thy (#2 p')), t),
+                map (fn (j, v) => (j, (v, fn () => compared v))) (given_values thy g t)))
+          else NONE
+        | _ => NONE)
+      |> sort (int_ord o apply2 #1) |> try hd |> Option.map #2;
+    val provided =
+      if define then (case super of NONE => continued () | SOME _ => NONE) else result;
+    (*the source with the values of its leaves, each with how it is shown: as that member stores
+      it, for a member of the family; where the member is the result, with its more*)
+    val sourced =
+      (case (super, provided) of
+        (NONE, SOME {source, values, more = more_A, ...}) =>
+          SOME (source,
+            values @ (if define then [] else [(length leaves_D, more_A)])
+            |> map (fn (j, u) => (j, (u, fn () => Syntax.string_of_term ctxt u))))
+      | _ => super);
+    val source_values = (case sourced of SOME (_, values) => values | NONE => []);
     (*the more of a view needs no value where its type is unit*)
     val units =
       map_index I leaves_D |> map_filter (fn (j, {name, typ, ...}) =>
         if is_none name andalso typ = HOLogic.unitT andalso
           List.last (leaf_path thy p_D j) = "more"
         then SOME (j, HOLogic.unit) else NONE);
-    (*a value as the messages show it: one read from a node, as it is compared*)
+    (*a value that a clause gives as the messages show it*)
     fun shown (v, (_, _, Given_Leaf _), _) = Syntax.string_of_term ctxt v
-      | shown (v, (_, _, Given_Node _), _) =
-          Syntax.string_of_term ctxt
-            (Thm.term_of (Thm.rhs_of (value_conv ctxt (Thm.cterm_of ctxt v))));
-    (*the value stored for a leaf, with how it is shown: that of the source, as it is written
-      there; else the one given directly; else the first that comes through a mapping*)
+      | shown (v, (_, _, Given_Node _), _) = compared v;
+    (*the value stored for a leaf that the source or a clause gives, with how it is shown: that
+      of the source, so that the equation of the source holds by the definition; else the first
+      given directly; else the first that comes through a mapping*)
     fun stored j =
-      (case AList.lookup (op =) inherited j of
-        SOME u => SOME (u, fn () => Syntax.string_of_term ctxt u)
+      (case AList.lookup (op =) source_values j of
+        SOME s => SOME s
       | NONE =>
           (case map #2 (filter (fn (j', _) => j' = j) given) of
-            [] => Option.map (rpair (K "()")) (AList.lookup (op =) units j)
+            [] => NONE
           | vs =>
               let val v = the_default (hd vs) (find_first #3 vs)
               in SOME (#1 v, fn () => shown v) end));
-    val value_of = Option.map #1 o stored;
+    fun value_of j =
+      (case stored j of SOME (u, _) => SOME u | NONE => AList.lookup (op =) units j);
     (*every value given to a leaf is the same as the one stored: the equations of those that
-      differ as they stand*)
+      differ as they stand.  Else one line for each leaf with another value, the first written
+      of them, the leaves in their order*)
+    val comparisons =
+      given |> map (fn (j, v) => (j, (v, same_value ctxt (#1 (the (stored j))) (#1 v))));
+    val _ =
+      (case distinct (eq_fst (op =)) (filter (is_none o #2 o #2) comparisons) of
+        [] => ()
+      | differing =>
+          error (cat_lines (sort (int_ord o apply2 #1) differing |> map (fn (j, (v, _)) =>
+            "The field " ^ implode_path (leaf_path thy p_D j) ^ " of " ^ xname ^
+              " has been defined as " ^ #2 (the (stored j)) () ^
+              ", but here you specified a different value `" ^ shown v ^ "`"))));
     val agreed =
-      given |> map_filter (fn (j, v) =>
-        let val (u, show) = the (stored j) in
-          (case same_value ctxt u (#1 v) of
-            SOME th => if Thm.is_reflexive th then NONE else SOME th
-          | NONE =>
-              error ("The field " ^ implode_path (leaf_path thy p_D j) ^ " of " ^ xname ^
-                " has been defined as " ^ show () ^
-                ", but here you specified a different value `" ^ shown v ^ "`"))
-        end);
+      comparisons |> map_filter (fn (_, (_, th)) =>
+        Option.mapPartial (Option.filter (not o Thm.is_reflexive)) th);
     val missing = filter_out (is_some o value_of o #1) (map_index I leaves_D);
     val _ = null missing orelse
       let
@@ -3561,8 +3606,7 @@ fun define_instance ctxt
           prove_definitional thy1 def param_names lhs constraint value;
         val base_more = app thy1 (#more (the_entry thy1 (base_name thy1)));
         val source =
-          (case (super, provided) of (NONE, SOME (_, s, _)) => SOME s | _ => super)
-          |> Option.map (fn (kind, layer, t) =>
+          sourced |> Option.map (fn ((kind, layer, t), _) =>
             let val truncate = app thy1 (#truncate (the_layer thy1 layer)) in
               {kind = kind, layer = layer, term = t,
                fields =
@@ -3610,7 +3654,7 @@ fun define_instance ctxt
       end;
   in
     if define then defined ()
-    else let val (src, _, _) = the provided in (instance_of src, thy) end
+    else (instance_of (#entry (the result)), thy)
   end;
 
 end;
