@@ -40,7 +40,7 @@ sig
   val own_layer: theory -> {family: string, concept: string} -> string * covering option
   val covered_layer: theory -> {family: string, concept: string} -> covering option
   val dest_scheme_type: theory -> typ -> (string * typ list * typ) option
-  datatype cong_rule = Congruence of thm | Commutes of {owner: string}
+  datatype cong_rule = Congruence of thm | Commutes of {owner: string, def: thm}
   val truncate_cong: Context.generic -> string * int -> cong_rule option
   val add_truncate_cong: string * int -> cong_rule -> Context.generic -> Context.generic
   val derive_truncate_cong: Proof.context -> {const: term, def: thm, position: int} ->
@@ -1409,19 +1409,49 @@ fun predicate_proc ctxt t w =
   argument:
   Congruence: O.truncate ?T = O.truncate ?S ==> f ... ?T ... = f ... ?S ...;
   Commutes: f ... (P.truncate ?S) ... = P.truncate (f ... ?S ...) for the layer P = owner and
-    every layer farther from the base, derived for each P when it is met*)
-datatype cong_rule = Congruence of thm | Commutes of {owner: string};
+    every layer farther from the base, derived from the definition def of f for each P when it
+    is met*)
+datatype cong_rule = Congruence of thm | Commutes of {owner: string, def: thm};
 
-(*by the constant and the position of the argument, from 0*)
+(*a rule as it was declared: its stamp, and the stamps of the rules that it replaced, with
+  those that they replaced*)
+type cong_entry = {rule: cong_rule, stamp: stamp, replaced: stamp list};
+
+(*the rule in use comes first: a theorem whose only premise is the one about the truncations,
+  then the other theorems, each kind in the order of theorems*)
+fun cong_ord (r, r') =
+  let
+    fun rank (Congruence th) = if Thm.nprems_of th = 1 then 0 else 1
+      | rank (Commutes _) = 2;
+  in
+    (case (int_ord (rank r, rank r'), r, r') of
+      (EQUAL, Congruence th, Congruence th') => Thm.thm_ord (th, th')
+    | (ord, _, _) => ord)
+  end;
+
+(*by the constant and the position of the argument, from 0: the rules declared there that no
+  later declaration has replaced.  A declaration replaces all that the theory has under the key;
+  two theories of which neither has the other may each bring a rule, and both stay*)
 structure Congs = Generic_Data
 (
-  type T = cong_rule Inttab.table Symtab.table;
+  type T = cong_entry list Inttab.table Symtab.table;
   val empty = Symtab.empty;
-  fun merge tabs = Symtab.join (K (Inttab.merge (K true))) tabs;
+  fun merge tabs =
+    Symtab.join (K (Inttab.join (K (fn (es, es') =>
+      let
+        val all = union (op = o apply2 #stamp) es es';
+        fun replaced ({stamp, ...}: cong_entry) =
+          exists (fn e: cong_entry => member (op =) (#replaced e) stamp) all;
+      in filter_out replaced all end)))) tabs;
 );
 
 fun truncate_cong context (c, i) =
-  Option.mapPartial (fn tab => Inttab.lookup tab i) (Symtab.lookup (Congs.get context) c);
+  Symtab.lookup (Congs.get context) c
+  |> Option.mapPartial (fn tab => Inttab.lookup tab i)
+  |> Option.mapPartial (fn es: cong_entry list =>
+    (case sort (cong_ord o apply2 #rule) es of
+      e :: _ => SOME (#rule e)
+    | [] => NONE));
 
 (*a term rewritten: the definition def unfolded, then the selector Simpset, then for a constant
   of this package the fixed rules down to the leaves*)
@@ -1443,20 +1473,27 @@ fun prove_cong ctxt own def lhs rhs =
   prove_cong_meta ctxt own def lhs rhs
   |> Option.map (fn th => th RS @{thm meta_eq_to_obj_eq});
 
-(*the rule of a constant at the argument position i, from its definition; names: the constant
-  is a view or an instance, with these names of its arguments.  None when the more slot of the
-  argument is no type variable, when that type variable is in the type of another argument, or
-  when the two sides differ*)
+(*a constant of this package: its definition is unfolded down to the leaves*)
+fun is_own thy c = is_some (head_of thy c);
+
+(*the names of the arguments of a constant in the rules shown to users: those given, as for a
+  view or an instance, else a, b, c*)
+fun arg_names names n =
+  let val used = ["T", "S", "r", "x"] in
+    (case names of
+      SOME names' => Name.variant_list used names'
+    | NONE => Name.invent (Name.make_context used) "a" n)
+  end;
+
+(*the rule of a constant at the argument position i, from its definition; names: those of its
+  arguments.  None when the more slot of the argument is no type variable, when that type
+  variable is in the type of another argument, or when the two sides differ*)
 fun derive_cong ctxt names {const = f, def, position = i} =
   let
     val thy = Proof_Context.theory_of ctxt;
+    val own = is_own thy (dest_Const_name f);
     val (Ts, U) = strip_type (fastype_of f);
-    val used = ["T", "S", "r", "x"];
-    val xs =
-      (case names of
-        SOME names' => Name.variant_list used names'
-      | NONE => Name.invent (Name.make_context used) "a" (length Ts))
-      |> map2 (fn T => fn x => Free (x, T)) Ts;
+    val xs = map2 (fn T => fn x => Free (x, T)) Ts (arg_names names (length Ts));
     fun args x = nth_map i (K x) xs;
     val others = map (#1 o dest_Free) (nth_drop i xs);
   in
@@ -1472,7 +1509,7 @@ fun derive_cong ctxt names {const = f, def, position = i} =
         in
           if exists occurs (Us @ nth_drop i Ts) then NONE
           else if not (occurs U) then
-            prove_cong ctxt (is_some names) def truncated (list_comb (f, args r))
+            prove_cong ctxt own def truncated (list_comb (f, args r))
             |> Option.map (fn eq =>
               let
                 val n = singleton (Name.variant_list (m :: map #1 (Term.add_tfrees f []))) "'n";
@@ -1487,8 +1524,8 @@ fun derive_cong ctxt names {const = f, def, position = i} =
                     (lambda x (list_comb (unit f, args x))) eq')
               end)
           else if U = nth Ts i then
-            prove_cong ctxt (is_some names) def truncated (truncate (list_comb (f, args r)))
-            |> Option.map (K (Commutes {owner = owner}))
+            prove_cong ctxt own def truncated (truncate (list_comb (f, args r)))
+            |> Option.map (K (Commutes {owner = owner, def = Thm.trim_context def}))
           else NONE
         end
     | _ => NONE)
@@ -1497,8 +1534,9 @@ fun derive_cong ctxt names {const = f, def, position = i} =
 fun derive_truncate_cong ctxt = derive_cong ctxt NONE;
 
 (*c xs[i := P.truncate x] = P.truncate (c xs) as a meta equation, for variables xs of the types
-  of args, x at the position i, where the instance c has the mark Commutes*)
-fun commuting ctxt P c i args =
+  of args, x at the position i, where the constant c with the definition def has the mark
+  Commutes*)
+fun commuting ctxt def P c i args =
   let
     val truncate = mk_truncate (Proof_Context.theory_of ctxt) P;
     val xs = map_index (fn (k, u) => Var (("x", k), fastype_of u)) args;
@@ -1507,13 +1545,13 @@ fun commuting ctxt P c i args =
     val g = Const (c, map fastype_of xs ---> fastype_of x);
     val g' = Const (c, map fastype_of xs' ---> fastype_of (truncate x));
     fun prove ctxt' =
-      get_instance_entry (Proof_Context.theory_of ctxt') c |> Option.mapPartial (fn {def, ...} =>
-        prove_cong_meta ctxt' true def (list_comb (g', xs')) (truncate (list_comb (g, xs))));
+      prove_cong_meta ctxt' (is_own (Proof_Context.theory_of ctxt') c) (Thm.transfer' ctxt' def)
+        (list_comb (g', xs')) (truncate (list_comb (g, xs)));
   in cached ctxt (list_comb (g', xs')) prove end;
 
 (*c args[i := P.truncate u] = P.truncate (c args), where args has u at the position i*)
-fun commuting_at ctxt P c i args =
-  commuting ctxt P c i args |> Option.map (fn th =>
+fun commuting_at ctxt def P c i args =
+  commuting ctxt def P c i args |> Option.map (fn th =>
     let
       val inst =
         map_index (fn (k, u) => ((("x", k), fastype_of u), Thm.cterm_of ctxt u)) args;
@@ -1567,14 +1605,17 @@ fun cong_proc ctxt ct =
                   end
                   (*a rule for other arguments than those of t*)
                   handle Pattern.MATCH => NONE)
-            | Commutes _ =>
-                Option.map (at_cterm ct) (commuting ctxt P (dest_Const_name f) i args'))
+            | Commutes {def, ...} =>
+                Option.map (at_cterm ct) (commuting ctxt def P (dest_Const_name f) i args'))
           end);
   in
     (case f of
       Const (c, _) =>
         (case Symtab.lookup (Congs.get (Context.Proof ctxt)) c of
-          SOME tab => get_first apply (Inttab.dest tab)
+          SOME tab =>
+            Inttab.keys tab |> get_first (fn i =>
+              truncate_cong (Context.Proof ctxt) (c, i)
+              |> Option.mapPartial (fn rule => apply (i, rule)))
         | NONE => NONE)
     | _ => NONE)
   end;
@@ -1758,13 +1799,15 @@ fun add_truncate_cong (c, i) rule context =
     val arity =
       (case rule of
         Congruence th => length (#2 (strip_comb (lhs_of (Thm.prop_of th))))
-      | Commutes _ => length (#params (the (get_instance_entry thy c))));
+      | Commutes _ => length (binder_types (Sign.the_const_type thy c)));
     val add = Simplifier.add_proc (simproc (Context.proof_of context) c [arity]);
     (*a selector, view, truncate or the base's predicate has its simproc of one argument*)
     val has = arity = 1 andalso is_some (get_kind thy c);
+    fun declared (old: cong_entry list) : cong_entry list =
+      [{rule = rule, stamp = stamp (), replaced = maps (fn e => #stamp e :: #replaced e) old}];
   in
     context
-    |> Congs.map (Symtab.map_default (c, Inttab.empty) (Inttab.update (i, rule)))
+    |> Congs.map (Symtab.map_default (c, Inttab.empty) (Inttab.map_default (i, []) declared))
     |> (is_none (truncate_cong context (c, i)) andalso not has) ?
         (Simplifier.map_simpset add #> map_selector_simpset add)
   end;
@@ -1955,17 +1998,15 @@ fun named_cong context (s, n) =
   in
     (case truncate_cong context (c, i) of
       SOME (Congruence th) => Thm.transfer thy th
-    | SOME (Commutes {owner}) =>
+    | SOME (Commutes {owner, def}) =>
         let
-          val names =
-            (case get_instance_entry thy c of
-              SOME {params, ...} => map (#1 o dest_Free) params
-            | NONE => map (fn k => "x" ^ string_of_int k) (0 upto length Ts - 1));
+          val params =
+            Option.map (map (#1 o dest_Free) o #params) (get_instance_entry thy c);
           val named =
             map_index (fn (k, (x, T)) => ((("x", k), T), Thm.cterm_of ctxt (Free (x, T))))
-              (names ~~ Ts);
+              (arg_names params (length Ts) ~~ Ts);
         in
-          (case commuting ctxt owner c i (map (Thm.term_of o #2) named) of
+          (case commuting ctxt def owner c i (map (Thm.term_of o #2) named) of
             SOME th =>
               Drule.export_without_context
                 (Thm.instantiate (TVars.empty, Vars.make named) th RS @{thm meta_eq_to_obj_eq})
@@ -2097,7 +2138,8 @@ datatype link =
 and arg =
   Whole of term * term * link  (*the arguments are equal*)
 | Rule of thm * level  (*a Congruence rule, the arguments made equal at its layer*)
-| Commuting of string * level  (*the mark Commutes: the arguments made equal at this layer*)
+| Commuting of thm * string * level
+    (*the mark Commutes with its definition: the arguments made equal at this layer*)
 (*layer.truncate a = layer.truncate b: the walks from a and from b, and what joins their ends*)
 and level = Level of {layer: string, a: term, b: term, left: walk, right: walk, link: link};
 
@@ -2183,12 +2225,20 @@ fun connect ctxt L (a, b) env =
       maps (fn n => map_filter (fn i =>
         if i < length ls andalso n - i < length rs then SOME (i, n - i) else NONE) (0 upto n))
         (0 upto length lnodes + length rnodes);
+    (*where a walk takes its first step along a source, else its end: up to there nothing needs
+      the concept of the two terms*)
+    fun before nodes =
+      (case find_index (fn (_, Along _) => true | _ => false) nodes of
+        ~1 => length nodes
+      | i => i);
+    fun joined (i, j) =
+      join ctxt (SOME L) (nth ls i, nth rs j) env |> Option.map (apsnd (level i j));
   in
     (case get_first (fn (i, j) =>
         Option.map (rpair (level i j Same)) (matches thy (nth ls i, nth rs j) env)) pairs of
       NONE =>
-        join ctxt (SOME L) (lend, rend) env
-        |> Option.map (apsnd (level (length lnodes) (length rnodes)))
+        get_first joined
+          (distinct (op =) [(before lnodes, before rnodes), (length lnodes, length rnodes)])
     | met => met)
   end
 
@@ -2212,9 +2262,10 @@ and join ctxt layer (x, y) env =
                     (case rule_layer thy th of
                       SOME L => joins (fn lev => Rule (th, lev)) (connect ctxt L (x_k, y_k) env)
                     | NONE => whole ())
-                | (SOME (Commutes {owner}), SOME L) =>
-                    let val P = if member (op =) (layers_from thy L) owner then L else owner
-                    in joins (fn lev => Commuting (P, lev)) (connect ctxt P (x_k, y_k) env) end
+                | (SOME (Commutes {owner, def}), SOME L) =>
+                    let val P = if member (op =) (layers_from thy L) owner then L else owner in
+                      joins (fn lev => Commuting (def, P, lev)) (connect ctxt P (x_k, y_k) env)
+                    end
                 | _ => whole ()))
           end
       | arg _ _ NONE = NONE;
@@ -2241,7 +2292,7 @@ fun needs_link _ Same = []
   | needs_link inst (Args args) = maps (needs_arg inst o #2) args
 and needs_arg inst (Whole (_, _, link)) = needs_link inst link
   | needs_arg inst (Rule (_, lev)) = needs_level inst lev
-  | needs_arg inst (Commuting (_, lev)) = needs_level inst lev
+  | needs_arg inst (Commuting (_, _, lev)) = needs_level inst lev
 and needs_level inst (Level {a, b, left, right, link, ...}) =
   (if went_along left orelse went_along right then [inst a, b] else []) @ needs_link inst link;
 
@@ -2251,7 +2302,7 @@ and equations_arg inst (Whole (x, y, link)) =
       {needs = needs_link inst link, x = inst x, y = y, origin = Of_Whole (x, y, link)} ::
         equations_link inst link
   | equations_arg inst (Rule (_, lev)) = equations_level inst lev
-  | equations_arg inst (Commuting (_, lev)) = equations_level inst lev
+  | equations_arg inst (Commuting (_, _, lev)) = equations_level inst lev
 and equations_level inst (lev as Level {a, b, left, right, link, ...}) : equation list =
   {needs = needs_level inst lev, x = inst a, y = b, origin = Of_Level lev} ::
   {needs = needs_link inst link, x = inst (#2 left), y = #2 right, origin = Of_Ends lev} ::
@@ -2262,7 +2313,7 @@ fun terms_link _ Same = []
   | terms_link inst (Args args) = maps (terms_arg inst o #2) args
 and terms_arg inst (Whole (x, y, link)) = inst x :: y :: terms_link inst link
   | terms_arg inst (Rule (_, lev)) = terms_level inst lev
-  | terms_arg inst (Commuting (_, lev)) = terms_level inst lev
+  | terms_arg inst (Commuting (_, _, lev)) = terms_level inst lev
 and terms_level inst (Level {left = (lnodes, lend), right = (rnodes, rend), link, ...}) =
   map (inst o #1) lnodes @ [inst lend] @ map #1 rnodes @ [rend] @ terms_link inst link;
 
@@ -2389,13 +2440,13 @@ fun prove_truncate_eq ctxt inst known (top: level) =
         | Args joined =>
             (case List.partition (fn (_, Commuting _) => true | _ => false) joined of
               ([], _) => cong ctxt truncate (args_eq x (#2 (strip_comb y)) joined)
-            | ([(k, Commuting (P, lev))], others) =>
+            | ([(k, Commuting (def, P, lev))], others) =>
                 let
                   (*the other arguments first; then the truncation moved out on both sides*)
                   val rest = args_eq x (#2 (strip_comb y)) others;
                   val x1 = #2 (HOLogic.dest_eq (HOLogic.dest_Trueprop (Thm.concl_of rest)));
                   val c = dest_Const_name (Term.head_of x1);
-                  fun out u = the (commuting_at ctxt P c k (#2 (strip_comb u)));
+                  fun out u = the (commuting_at ctxt def P c k (#2 (strip_comb u)));
                   val out_x = out x1;
                   val inside = cong ctxt (replaced (lhs_of (Thm.prop_of out_x)) k) (level_eq lev);
                   val moved = trans (sym out_x) (trans inside (out y));
@@ -3262,21 +3313,22 @@ fun define_instance ctxt
         val src as {const, concept = p_A, params = params_A, ...} =
           the (get_instance_entry thy member);
         val print_typ = quote o Syntax.string_of_typ ctxt;
+        (*what is compared: the two members as functions of their parameters, cut down to the
+          layer*)
+        val T_A = map fastype_of params_A ---> part layer p_A;
+        val T_D = paramTs ---> part layer p_D;
         fun type_error () =
           let val l = Long_Name.base_name layer in
             error (cat_lines
              ["Cannot define " ^ xname ^ Position.here (Binding.pos_of b) ^ ": its " ^ l ^
                 " part must have the type of " ^ shown ^ ", which the family " ^
                 Long_Name.base_name (the family) ^ " already has",
-              "  " ^ shown ^ " :: " ^
-                print_typ (funpow (length params_A) range_type (fastype_of const)),
-              "  the " ^ l ^ " part of " ^ xname ^ " :: " ^ print_typ (part layer p_D),
+              "  " ^ shown ^ " :: " ^ print_typ T_A,
+              "  the " ^ l ^ " part of " ^ xname ^ " :: " ^ print_typ T_D,
               "Check your type declarations"])
           end;
         val tyenv =
-          fold (Sign.typ_match thy)
-            ((map (Logic.varifyT_global o fastype_of) params_A ~~ paramTs) @
-              [(Logic.varifyT_global (part layer p_A), part layer p_D)]) Vartab.empty
+          Sign.typ_match thy (Logic.varifyT_global T_A, T_D) Vartab.empty
           handle Type.TYPE_MATCH => type_error ();
         val t = list_comb (Envir.subst_term_types tyenv (Logic.varify_types_global const), params);
         val values = take (leaf_count thy layer) (#1 (instance_with tyenv src params));
