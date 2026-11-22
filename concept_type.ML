@@ -5,8 +5,8 @@ with leaves of its own adds a layer: a typedef over a balanced tuple of its leav
 slot.  All chains start at the base concept "concept", whose single bool leaf is read by the
 predicate concept.  A parent with a qualifier is a view: its leaves not given by "where" are
 stored as anonymous leaves, and the view constant rebuilds its value.  An anonymous leaf is read
-only through the view holding it.  The names that expose the representation (Abs, Rep,
-truncate, definitions) cannot be reached by any input.  Proofs inside rewrite with fixed rules
+only through the view holding it.  The names that expose the representation (Abs, Rep, the
+definitions) cannot be reached by any input.  Proofs inside rewrite with fixed rules
 only.  A selector simproc synthesizes the equations of the selectors on instances, views and
 truncate.  The selector Simpset rewrites with these simprocs and with no rule of the theory's
 simpset; as in simp, what its congruence rules assume (P in P --> Q, x : A under a bounded
@@ -963,8 +963,9 @@ val cache =
   Synchronized.var "Concept_Type.cache"
     (0, Termtab.empty: thm Unsynchronized.weak_ref Termtab.table);
 
-(*the finished ancestor theory that has every constant and type constructor of t, if any: what
-  is proved there serves all theories that import it*)
+(*the finished ancestor theory that has every constant and type constructor of t and in which
+  the constants of t have well-sorted types, if any: what is proved there serves all theories
+  that import it*)
 fun home thy t =
   let
     val names =
@@ -973,20 +974,24 @@ fun home thy t =
       map (Name_Space.theory_name {long = true} (Sign.type_space thy))
         (Term.fold_types add_tycos t [])
       |> distinct (op =);
-    fun later thy' (SOME thy'') =
-          if Context.subthy (thy'', thy') then SOME thy'
-          else if Context.subthy (thy', thy'') then SOME thy''
-          else NONE
-      | later _ NONE = NONE;
+    val thys = map (try (Context.get_theory {long = true} thy)) names;
+    (*a class or an arity of the types of t may be younger than the theory*)
+    fun well_sorted thy' =
+      Term.fold_aterms (fn Const (c, T) => (fn ok =>
+          ok andalso Sign.typ_instance thy' (T, Sign.the_const_type thy' c))
+        | _ => I) t true;
   in
-    (case map (try (Context.get_theory {long = true} thy)) names of
-      [] => NONE
-    | thys => if forall is_some thys then fold (later o the) (tl thys) (hd thys) else NONE)
+    if null thys orelse exists is_none thys then NONE
+    else
+      let val thys' = map the thys in
+        find_first (fn thy' => forall (fn thy'' => Context.subthy (thy'', thy')) thys') thys'
+        |> Option.mapPartial (Option.filter well_sorted)
+      end
   end;
 
 (*the meta equation whose left side is key: the one stored, when the theory has the theory of
-  that; else proved, first in the home of key, and stored unless the one stored serves the
-  theories that the new one serves*)
+  that; else proved, in the home of key or in the theory, apart from what the context assumes,
+  and stored unless the one stored serves the theories that the new one serves*)
 fun cached ctxt key prove =
   let
     val thy = Proof_Context.theory_of ctxt;
@@ -1001,10 +1006,7 @@ fun cached ctxt key prove =
       in if n < 255 then (n + 1, tab') else (0, Termtab.fold live tab' Termtab.empty) end;
     fun proved () =
       let
-        val ctxts =
-          (case home thy key of
-            SOME thy' => [Proof_Context.init_global thy', ctxt]
-          | NONE => [ctxt]);
+        val ctxts = map Proof_Context.init_global (the_list (home thy key) @ [thy]);
       in
         get_first prove ctxts |> Option.map (fn th =>
           (Synchronized.change cache (store (Thm.trim_context th)); Thm.transfer thy th))
@@ -1354,15 +1356,14 @@ fun along_source ctxt P t w =
                   |> instantiate_at ctxt lhs_of t;
                 val source = #2 (dest_comb (HOLogic.dest_Trueprop (nth (Thm.prems_of eq) 1)));
                 val forward' = Option.map (instantiate_at ctxt premise_structure_of w) forward;
+                (*concept source: by its hidden field, else from concept w; then concept w*)
+                val eq1 =
+                  (case (concept_holds ctxt source, forward') of
+                    (SOME b, _) => Thm.implies_elim (Drule.rotate_prems 1 eq) b
+                  | (NONE, SOME th) => follows eq th
+                  | (NONE, NONE) => eq);
                 val eq' =
-                  (case (concept_holds ctxt w, concept_holds ctxt source, forward') of
-                    (SOME a, SOME b, _) => Drule.implies_elim_list eq [a, b]
-                  | (SOME a, NONE, SOME th) =>
-                      Drule.implies_elim_list eq [a, Thm.implies_elim th a]
-                  | (SOME a, NONE, NONE) => Thm.implies_elim eq a
-                  | (NONE, SOME b, _) => Thm.implies_elim (Drule.rotate_prems 1 eq) b
-                  | (NONE, NONE, SOME th) => follows eq th
-                  | (NONE, NONE, NONE) => eq);
+                  (case concept_holds ctxt w of SOME a => Thm.implies_elim eq1 a | NONE => eq1);
                 val bare =
                   Conv.concl_conv ~1
                     (HOLogic.Trueprop_conv (Conv.arg_conv (Conv.rewr_conv (ident_of thy P))));
@@ -1444,6 +1445,10 @@ structure Congs = Generic_Data
           exists (fn e: cong_entry => member (op =) (#replaced e) stamp) all;
       in filter_out replaced all end)))) tabs;
 );
+
+(*the number of arguments of the constant c in a rule of it*)
+fun rule_arity _ _ (Congruence th) = length (#2 (strip_comb (lhs_of (Thm.prop_of th))))
+  | rule_arity thy c (Commutes _) = length (binder_types (Sign.the_const_type thy c));
 
 fun truncate_cong context (c, i) =
   Symtab.lookup (Congs.get context) c
@@ -1569,8 +1574,9 @@ fun cong_proc ctxt ct =
         (Const (c, _), [u]) =>
           (case get_kind thy c of SOME (Truncate P) => SOME (P, u) | _ => NONE)
       | _ => NONE);
+    (*a rule speaks about the constant with all its arguments*)
     fun apply (i, rule) =
-      if i >= length args then NONE
+      if length args <> rule_arity thy (dest_Const_name f) rule then NONE
       else
         truncation (nth args i) |> Option.mapPartial (fn (P, u) =>
           let
@@ -1579,32 +1585,30 @@ fun cong_proc ctxt ct =
           in
             (case rule of
               Congruence th =>
-                if length (#2 (strip_comb (lhs_of (Thm.prop_of th)))) <> length args then NONE
-                else
-                  (let
-                    (*the two sides give ?T and ?S; the premise about them is two truncations
-                      merged*)
-                    val th' =
-                      th |> instantiate_at ctxt (HOLogic.mk_prod o HOLogic.dest_eq o concl_of)
-                        (HOLogic.mk_prod (t, at (fastype_of t)));
-                    fun merged prem =
-                      (case try (HOLogic.dest_eq o HOLogic.dest_Trueprop) prem of
-                        SOME (twice as Const (c, _) $ a, Const (c', _) $ b) =>
-                          if c = c' andalso a aconv nth args i andalso b aconv u
-                          then Option.map (pair twice o #1) (truncation twice) else NONE
-                      | _ => NONE);
-                    val prems = Thm.prems_of th';
-                    val k = find_index (is_some o merged) prems;
-                  in
-                    if k < 0 then NONE
-                    else
-                      let val (twice, owner) = the (merged (nth prems k)) in
-                        SOME (meta (instantiate_at ctxt lhs_of twice (truncate_merge thy owner P)
-                          RSN (k + 1, th')))
-                      end
-                  end
-                  (*a rule for other arguments than those of t*)
-                  handle Pattern.MATCH => NONE)
+                (let
+                  (*the two sides give ?T and ?S; the premise about them is two truncations
+                    merged*)
+                  val th' =
+                    th |> instantiate_at ctxt (HOLogic.mk_prod o HOLogic.dest_eq o concl_of)
+                      (HOLogic.mk_prod (t, at (fastype_of t)));
+                  fun merged prem =
+                    (case try (HOLogic.dest_eq o HOLogic.dest_Trueprop) prem of
+                      SOME (twice as Const (c, _) $ a, Const (c', _) $ b) =>
+                        if c = c' andalso a aconv nth args i andalso b aconv u
+                        then Option.map (pair twice o #1) (truncation twice) else NONE
+                    | _ => NONE);
+                  val prems = Thm.prems_of th';
+                  val k = find_index (is_some o merged) prems;
+                in
+                  if k < 0 then NONE
+                  else
+                    let val (twice, owner) = the (merged (nth prems k)) in
+                      SOME (meta (instantiate_at ctxt lhs_of twice (truncate_merge thy owner P)
+                        RSN (k + 1, th')))
+                    end
+                end
+                (*a rule for other arguments than those of t*)
+                handle Pattern.MATCH => NONE)
             | Commutes {def, ...} =>
                 Option.map (at_cterm ct) (commuting ctxt def P (dest_Const_name f) i args'))
           end);
@@ -1738,19 +1742,33 @@ fun selector_proc ctxt ct =
           | _ => NONE));
   in if is_some selected then selected else cong_proc ctxt ct end;
 
-(*the simproc of the constant c applied to n arguments, for each n of ns*)
-fun simproc ctxt c ns =
-  let
-    val f = const_of (Proof_Context.theory_of ctxt) c;
-    fun lhs n =
-      list_comb (f,
-        take n (binder_types (fastype_of f))
-        |> map_index (fn (k, T) => Free ("x" ^ string_of_int k, T)));
-  in
-    Simplifier.make_simproc ctxt
-      {name = c, kind = Simplifier.Simproc, lhss = map lhs ns, proc = K selector_proc,
-       identifier = []}
+(*the constant c applied to n arguments*)
+fun applied_to thy c n =
+  let val f = const_of thy c in
+    list_comb (f,
+      take n (binder_types (fastype_of f))
+      |> map_index (fn (k, T) => Free ("x" ^ string_of_int k, T)))
   end;
+
+(*the numbers of arguments on which a constant has its simproc by its kind: one, the structure;
+  for a leaf that is a function, also all arguments of the function*)
+fun kind_arities thy c =
+  (case get_kind thy c of
+    SOME (Leaf_Sel _) =>
+      (case length (binder_types (range_type (Sign.the_const_type thy c))) of
+        0 => [1]
+      | n => [1, n + 1])
+  | SOME _ => [1]
+  | NONE => []);
+
+(*the simproc on these left sides, in the simpset and in the selector Simpset*)
+fun add_selector_simproc name lhss context =
+  let
+    val add =
+      Simplifier.add_proc (Simplifier.make_simproc (Context.proof_of context)
+        {name = name, kind = Simplifier.Simproc, lhss = lhss, proc = K selector_proc,
+         identifier = []});
+  in context |> Simplifier.map_simpset add |> map_selector_simpset add end;
 
 (*the split of the more of the layer below that of concept name, whose views are defined; its
   simproc on the equations at the type of this layer*)
@@ -1778,38 +1796,32 @@ fun add_split name thy =
                 (put_simpset HOL_basic_ss ctxt
                   |> Simplifier.add_simps @{thms prod_eq_iff conj_assoc}) 1 THEN
               TRY (resolve_tac ctxt @{thms refl} 1));
-        val add =
-          Simplifier.add_proc (Simplifier.make_simproc (Proof_Context.init_global thy)
-            {name = ext, kind = Simplifier.Simproc, lhss = [lhs], proc = K selector_proc,
-             identifier = []});
       in
         thy
         |> Splits.map (Symtab.update (name, th))
-        |> Simplifier.map_theory_simpset add
-        |> Context.theory_map (map_selector_simpset add)
+        |> Context.theory_map (add_selector_simproc ext [lhs])
       end
   | _ => thy);
 
-(*a rule enters the table, in place of the one at its position; the first rule of a constant
-  at a position brings the constant's simproc, in the simpset and in the selector Simpset, unless
-  the constant has it already*)
+(*a rule enters the table, in place of those that the context has at its position; it brings
+  the constant's simproc on the arguments of the rule unless the constant has one on as many*)
 fun add_truncate_cong (c, i) rule context =
   let
     val thy = Context.theory_of context;
-    val arity =
-      (case rule of
-        Congruence th => length (#2 (strip_comb (lhs_of (Thm.prop_of th))))
-      | Commutes _ => length (binder_types (Sign.the_const_type thy c)));
-    val add = Simplifier.add_proc (simproc (Context.proof_of context) c [arity]);
-    (*a selector, view, truncate or the base's predicate has its simproc of one argument*)
-    val has = arity = 1 andalso is_some (get_kind thy c);
+    val arity = rule_arity thy c rule;
+    val present =
+      kind_arities thy c @
+      (case Symtab.lookup (Congs.get context) c of
+        SOME tab =>
+          Inttab.fold (fn (_, es: cong_entry list) =>
+            fold (cons o rule_arity thy c o #rule) es) tab []
+      | NONE => []);
     fun declared (old: cong_entry list) : cong_entry list =
       [{rule = rule, stamp = stamp (), replaced = maps (fn e => #stamp e :: #replaced e) old}];
   in
     context
     |> Congs.map (Symtab.map_default (c, Inttab.empty) (Inttab.map_default (i, []) declared))
-    |> (is_none (truncate_cong context (c, i)) andalso not has) ?
-        (Simplifier.map_simpset add #> map_selector_simpset add)
+    |> not (member (op =) present arity) ? add_selector_simproc c [applied_to thy c arity]
   end;
 
 (*the rules of a view or instance constant with the given definition and names of its
@@ -1822,20 +1834,12 @@ fun add_derived_congs f def names thy =
       | NONE => I)) names
   end;
 
-(*a constant the simproc knows, with its simproc in the simpset of the theory and in the
-  selector Simpset: on the constant applied to a structure; for a leaf that is a function, also
-  with all arguments of the function*)
+(*a constant the simproc knows, with its simproc*)
 fun register c kind thy =
-  let
-    val thy' = Kinds.map (Symtab.update (c, kind)) thy;
-    val n =
-      (case kind of
-        Leaf_Sel _ => length (binder_types (range_type (Sign.the_const_type thy' c)))
-      | _ => 0);
-    val add =
-      Simplifier.add_proc
-        (simproc (Proof_Context.init_global thy') c (if n = 0 then [1] else [1, n + 1]));
-  in thy' |> Simplifier.map_theory_simpset add |> Context.theory_map (map_selector_simpset add) end;
+  let val thy' = Kinds.map (Symtab.update (c, kind)) thy in
+    thy' |> Context.theory_map
+      (add_selector_simproc c (map (applied_to thy' c) (kind_arities thy' c)))
+  end;
 
 (*the selectors, more and truncate of the layer of concept name; the base's predicate is no
   selector*)
@@ -1910,10 +1914,13 @@ fun fact_structure thy th =
     | NONE => NONE)
   end;
 
-(*f applied to t: a constant f at the type that fits t; ill-typed when none does*)
+(*f applied to t: a constant f that is a function, at the type that fits t; ill-typed when
+  none does*)
 fun applied thy f t =
   (case f of
-    Const (c, _) => (app thy (const_of thy c) t handle Type.TYPE_MATCH => f $ t)
+    Const (c, T) =>
+      if can dest_funT T then (app thy (const_of thy c) t handle Type.TYPE_MATCH => f $ t)
+      else f $ t
   | _ => f $ t);
 
 (*on a fact C t the equation of the given selector on t; in [[...]] that of the given term*)
@@ -1988,7 +1995,7 @@ fun named_cong context (s, n) =
   let
     val ctxt = Context.proof_of context;
     val thy = Proof_Context.theory_of ctxt;
-    val c = dest_Const_name (Proof_Context.read_const {proper = true, strict = false} ctxt s);
+    val c = dest_Const_name (Proof_Context.read_const {proper = true, strict = true} ctxt s);
     val Ts = binder_types (fastype_of (const_of thy c));
     val positions = filter (is_some o dest_scheme_type thy o nth Ts) (0 upto length Ts - 1);
     fun none () =
@@ -2031,7 +2038,7 @@ val _ =
 
 (** the fact trigger of Sledgehammer **)
 
-(*a constant with a simproc: a selector, a truncate, the base's predicate, one with a rule*)
+(*a constant with a simproc: one that the simproc knows by its kind, or one with a rule*)
 fun has_simproc ctxt c =
   is_some (get_kind (Proof_Context.theory_of ctxt) c) orelse
   Symtab.defined (Congs.get (Context.Proof ctxt)) c;
@@ -2282,7 +2289,8 @@ and join ctxt layer (x, y) env =
 
 (* which structures are legal *)
 
-(*an equation of the comparison between x and y, usable once the structures needs are legal*)
+(*an equation of the comparison between x and y, usable once the structures in needs are
+  legal*)
 datatype origin = Of_Level of level | Of_Ends of level | Of_Whole of term * term * link;
 type equation = {needs: term list, x: term, y: term, origin: origin};
 
@@ -3258,8 +3266,9 @@ fun add_implication c th thy =
 (*the constant x :: params => D, its value built from the where clauses; the layers that its
   source has are taken from the source, whose values must agree with the given ones.  The
   source is the t of "where super = t", else the member of the family providing the nearest
-  layer of D.  Without define no constant is made: the given values are checked against the
-  source, which is returned*)
+  layer of D.  Without define, which the caller passes only when a member of the family owns
+  the layer of D and no super is given, no constant is made: the given values are checked
+  against that member, which is returned*)
 fun define_instance ctxt
     {family, name = b, define, concept = p_D, params, where_, constraint} thy =
   let
@@ -3318,12 +3327,16 @@ fun define_instance ctxt
         val T_A = map fastype_of params_A ---> part layer p_A;
         val T_D = paramTs ---> part layer p_D;
         fun type_error () =
-          let val l = Long_Name.base_name layer in
+          let
+            val l = Long_Name.base_name layer;
+            (*a member with a wider type of its own is named by its part*)
+            val shown' = if fastype_of const = T_A then shown else "the " ^ l ^ " part of " ^ shown;
+          in
             error (cat_lines
              ["Cannot define " ^ xname ^ Position.here (Binding.pos_of b) ^ ": its " ^ l ^
-                " part must have the type of " ^ shown ^ ", which the family " ^
+                " part must have the type of " ^ shown' ^ ", which the family " ^
                 Long_Name.base_name (the family) ^ " already has",
-              "  " ^ shown ^ " :: " ^ print_typ T_A,
+              "  " ^ shown' ^ " :: " ^ print_typ T_A,
               "  the " ^ l ^ " part of " ^ xname ^ " :: " ^ print_typ T_D,
               "Check your type declarations"])
           end;
@@ -3357,13 +3370,13 @@ fun define_instance ctxt
               " has been defined as " ^ Syntax.string_of_term ctxt u ^
               ", but here you specified a different value `" ^ Syntax.string_of_term ctxt t ^ "`")
       | NONE => ()));
-    (*the layers of the source hold the source's values as they are written there*)
     (*the more of a view needs no value where its type is unit*)
     val units =
       map_index I leaves_D |> map_filter (fn (j, {name, typ, ...}) =>
         if is_none name andalso typ = HOLogic.unitT andalso
           List.last (leaf_path thy p_D j) = "more"
         then SOME (j, HOLogic.unit) else NONE);
+    (*the layers of the source hold the source's values as they are written there*)
     val value_of = AList.lookup (op =) (inherited @ given @ units);
     val missing = filter_out (is_some o value_of o #1) (map_index I leaves_D);
     val _ = null missing orelse
