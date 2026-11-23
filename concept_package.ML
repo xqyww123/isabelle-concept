@@ -785,6 +785,7 @@ fun target name : Named_Target.other_target =
         |> Proof_Context.add_assms Assumption.assume_export
             [((axioms, [Classical.safe_intro NONE]), [(assumption, [])])] |> #2
         |> Proof_Context.put_default_fact_qualifiers (qualifiers thy name)
+        |> Config.put Local_Theory.global_form_enabled true
       end;
     fun pretty lthy =
       let
