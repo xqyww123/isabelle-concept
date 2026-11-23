@@ -49,6 +49,7 @@ sig
   val map_selector_simpset: (Proof.context -> Proof.context) -> Context.generic -> Context.generic
   val selector_equation: Proof.context -> term -> thm option
   val source_equation: Proof.context -> term -> thm option
+  val concept_holds: Proof.context -> term -> thm option
   datatype item =
     Field of binding * typ
   | View of {qualifier: binding, parent: parent, more: typ,
@@ -702,7 +703,7 @@ fun no_field_error thy cname prefix (walked, p, seg, pos) =
     val head =
       if null path then "The concept " ^ cname
       else
-        "The parent " ^ implode_path path ^ ": " ^ quote (pretty_parent thy p) ^ " of concept " ^
+        "The field " ^ implode_path path ^ ": " ^ quote (pretty_parent thy p) ^ " of concept " ^
           cname;
   in error (head ^ " has no field named " ^ seg ^ Position.here pos ^ "\n" ^ fields_line thy p) end;
 
@@ -794,8 +795,8 @@ fun read_against ctxt owner path (T, shown_T) part rhs =
     handle ERROR msg =>
       let
         val u = Syntax.read_term ctxt rhs handle ERROR _ => error msg;
-        val field =
-          implode_path (map #1 path) ^ Position.here (#2 (List.last path)) ^ " of " ^ owner;
+        val name = implode_path (map #1 path);
+        val of_owner = Position.here (#2 (List.last path)) ^ " of " ^ owner;
         val shown = quote (Syntax.string_of_typ ctxt shown_T);
         val value =
           quote (Syntax.string_of_term ctxt u) ^ " has type " ^
@@ -803,11 +804,11 @@ fun read_against ctxt owner path (T, shown_T) part rhs =
       in
         (case part of
           SOME q =>
-            error (field ^ " stands for its " ^ Long_Name.base_name q ^ " part, of type " ^
-              shown ^ ", but the given value " ^ value)
+            error (quote name ^ of_owner ^ " stands for its " ^ Long_Name.base_name q ^
+              " part, of type " ^ shown ^ ", but the assigned value " ^ value)
         | NONE =>
-            error ("The field " ^ field ^ " expects type " ^ shown ^ ", but the given value " ^
-              value))
+            error ("The field " ^ name ^ of_owner ^ " expects type " ^ shown ^
+              ", but the assigned value " ^ value))
       end;
 
 (*read the right-hand side of a where clause in the node of p with the more slot of type more,
@@ -3073,7 +3074,7 @@ fun check_parent thy cname (Ts, name) =
     val _ = (Ts ~~ args) |> List.app (fn (T, (a, S)) =>
       if Sign.of_sort thy (T, S) then ()
       else
-        error ("Ill-sorted type argument for parent concept " ^ quote bname ^ " in concept " ^
+        error ("Ill-sorted type " ^ quote (pretty_parent thy (Ts, name)) ^ " in concept " ^
           quote cname ^ ": " ^ Syntax.string_of_typ_global thy T ^ " does not have sort " ^
           Syntax.string_of_sort_global thy S ^ ", as the type parameter " ^ a ^ " of " ^
           quote bname ^ " requires"));
@@ -3155,8 +3156,9 @@ fun check_used cname args (Ts, _) views bleaves =
         in
           [head in_views ^ ". Although " ^ commas (map #1 in_views) ^
             (if one then " occurs in " else " occur in ") ^
-            (case qs of [_] => "the type of the parent " | _ => "the types of the parents ") ^
-            commas_quote qs ^ ", no field actually uses " ^ (if one then "it" else "them")]
+            (case qs of [_] => "the type of the field " | _ => "the types of the fields ") ^
+            commas_quote qs ^ ", every field of " ^ commas_quote qs ^ " that uses " ^
+            (if one then "it" else "them") ^ " is assigned by \"where\""]
         end;
     val lines = nowhere_line @ in_views_line;
   in if null lines then () else error (cat_lines lines) end;
@@ -3180,9 +3182,9 @@ fun layer_leaves [] _ _ = ([], [])
   | layer_leaves (View _ :: _) [] _ = raise Match;
 
 (*the context in which the terms of a header of the concept are read: S, every named field and
-  every view among the children is a variable, and so is each of pending, the views that are
-  not defined yet; with what the variables that are defined stand for*)
-fun reading_context thy name children pending =
+  every view defined so far is a variable, and so is each of pending; with what the variables
+  that are defined stand for*)
+fun reading_context thy name pending =
   let
     val {args, scheme = sT, ...} = the_entry thy name;
     val p_C = (map TFree args, name);
@@ -3190,7 +3192,7 @@ fun reading_context thy name children pending =
       flat_leaves thy p_C |> map_index I |> map_filter (fn (i, {name = SOME c, typ, ...}) =>
         SOME (Long_Name.base_name c, typ, i) | _ => NONE);
     val defined =
-      children |> map_filter (fn (x, (View_Child {const, parent, more, ...}, _)) =>
+      children thy p_C |> map_filter (fn (x, (View_Child {const, parent, more, ...}, _)) =>
         SOME (x, const, scheme_type thy parent more) | _ => NONE);
     val ctxt0 = Proof_Context.init_global thy |> fold (Variable.declare_typ o TFree) args;
     val ([s_name], ctxt1) = Proof_Context.add_fixes [(Binding.name "\<S>", SOME sT, NoSyn)] ctxt0;
@@ -3208,10 +3210,7 @@ fun reading_context thy name children pending =
 
 (*the same for a concept that is declared*)
 fun header_context thy name =
-  let
-    val {args, ...} = the_entry thy name;
-    val {context, S, substitution, ...} =
-      reading_context thy name (children thy (map TFree args, name)) [];
+  let val {context, S, substitution, ...} = reading_context thy name []
   in {context = context, S = S, substitution = substitution} end;
 
 fun declare {name = b, args, parent, items} thy0 =
@@ -3258,7 +3257,7 @@ fun declare {name = b, args, parent, items} thy0 =
     val sT = #scheme (the_entry thy1 name);
     val leaves_C = flat_leaves thy1 p_C;
     val {context = ctxt, S, substitution = base_subst, pending = view_names} =
-      reading_context thy1 name (children thy1 parent')
+      reading_context thy1 name
         (views |> map (fn {qualifier, parent = p, more, ...} =>
           (qualifier, SOME (scheme_type thy1 p more), NoSyn)));
     val s_name = #1 (dest_Free S);
@@ -3435,9 +3434,10 @@ fun add_implication c th thy =
   source has are taken from the source, whose values must agree with the given ones.  The
   source is the t of the clause that names a part by super alone with the shortest path, the
   first written among equal ones; else the member of the family providing the nearest layer of
-  D.  Without define, which the caller passes only when a member of the family owns the layer
-  of D and no super is given, no constant is made: the given values, that of more among them,
-  are checked against that member, which is returned*)
+  D.  A member of a family has no more of its own: what extends it is the further members.
+  Without define, which the caller passes only when a member of the family owns the layer of D
+  and no super is given, no constant is made: the given values are checked against that member,
+  which is returned*)
 fun define_instance ctxt
     {family, name = b, define, concept = p_D, params, where_, constraint} thy =
   let
@@ -3446,6 +3446,13 @@ fun define_instance ctxt
     val leaves_D = flat_leaves thy p_D;
     val (more_clauses, clauses) =
       List.partition (fn ([("more", _)], _) => true | _ => false) where_;
+    val _ =
+      (case (family, more_clauses) of
+        (SOME f, ([(_, pos)], _) :: _) =>
+          error ("Cannot assign the field \"more\"" ^ Position.here pos ^ " to " ^ xname ^
+            ", a member of a family " ^ quote (Long_Name.base_name f) ^
+            ", because the field is determined by the further members in the family")
+      | _ => ());
     val entries =
       resolve_entries thy (p_D, HOLogic.unitT) (no_field_error thy dname []) xname clauses;
     val param_names = map (#1 o dest_Free) params;
@@ -3490,32 +3497,23 @@ fun define_instance ctxt
           handle Type.TYPE_MATCH => type_error ();
         val m = Envir.subst_term_types tyenv o Logic.varify_types_global;
         val values = map (instance_subst m src params) (take (leaf_count thy layer) (#values src));
-        (*a type variable that only the more of the member has is left open by the match*)
-        val more =
-          the_single (#1 (Variable.importT_terms [instance_subst m src params (#more src)] ctxt));
       in
         {entry = src, source = (Family, layer, list_comb (m const, params)),
-         values = map_index I values, more = more}
+         values = map_index I values}
       end;
     fun continued () =
       family |> Option.mapPartial (fn f =>
         layers_of thy p_D |> get_first (fn layer =>
           Option.map (member_at layer) (Symtab.lookup (providers thy f) layer)));
-    (*without define that member is the result, its more too: it is found before the clauses are
-      read*)
+    (*without define that member is the result*)
     val result = if define then NONE else continued ();
 
-    (* more: that of the result; else given by where clauses, the first of them fixing its
-       type; else () *)
+    (* more: given by where clauses, the first of them fixing its type; else () *)
     val first_more =
-      (case (result, more_clauses) of
-        (NONE, (_, rhs) :: _) => SOME (Syntax.read_term ctxt rhs)
-      | _ => NONE);
-    val more =
-      (case (result, first_more) of
-        (SOME {more, ...}, _) => more
-      | (NONE, SOME t) => t
-      | (NONE, NONE) => HOLogic.unit);
+      (case more_clauses of
+        (_, rhs) :: _ => SOME (Syntax.read_term ctxt rhs)
+      | [] => NONE);
+    val more = the_default HOLogic.unit first_more;
     val moreT = fastype_of more;
     val T = paramTs ---> scheme_type thy p_D moreT;
     val ctxt = Variable.declare_typ T ctxt;
@@ -3560,13 +3558,12 @@ fun define_instance ctxt
     val provided =
       if define then (case super of NONE => continued () | SOME _ => NONE) else result;
     (*the source with the values of its leaves, each with how it is shown: as that member stores
-      it, for a member of the family; where the member is the result, with its more*)
+      it, for a member of the family*)
     val sourced =
       (case (super, provided) of
-        (NONE, SOME {source, values, more = more_A, ...}) =>
+        (NONE, SOME {source, values, ...}) =>
           SOME (source,
-            values @ (if define then [] else [(length leaves_D, more_A)])
-            |> map (fn (j, u) => (j, (u, fn () => Syntax.string_of_term ctxt u))))
+            values |> map (fn (j, u) => (j, (u, fn () => Syntax.string_of_term ctxt u))))
       | _ => super);
     val source_values = (case sourced of SOME (_, values) => values | NONE => []);
     (*the more of a view needs no value where its type is unit*)

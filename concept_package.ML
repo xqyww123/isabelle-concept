@@ -13,10 +13,10 @@ sig
    {args: (string * string option) list, name: binding, major: string option, items: item list,
     assumes: (Attrib.binding * (string * string list) list) list}
   val header: header parser
-  datatype kind = Major | View of string | Edge | Plain
-  type component = {kind: kind, concept: string option, name: string option, rule: thm}
+  datatype kind = Major of string | View of string * string | Edge of string | Plain
+  type component = {kind: kind, name: Thm_Name.T option, rule: thm}
   type concept = {name: string, def: thm, components: component list, construction: thm}
-  type entailment = {distance: int, entailment: thm, path: string list option}
+  type entailment = {distance: int, entailment: thm, path: Thm_Name.T list option}
   val get_concept: theory -> string -> concept option
   val the_concept: theory -> string -> concept
   val entailment: theory -> string -> string -> entailment option
@@ -54,7 +54,7 @@ fun bad_syntax pos =
     "    + ord: \"'a order\" where carrier = carrier",
     "    + norm :: \"'a \<Rightarrow> real\"",
     "    + assumes mono: \"x \<sqsubseteq>\<^bsub>ord\<^esub> y \<Longrightarrow> x * z \<sqsubseteq>\<^bsub>ord\<^esub> y * z\"",
-    "The first parent has no name; every later parent and every assumption has one"];
+    "The parent has no name; every field and every assumption has one"];
 
 fun cut parser =
   Scan.!! (fn (toks: Token.T list, _) => fn () =>
@@ -86,10 +86,10 @@ val item: item parser =
   >> (fn (((b, T), mx), wh) =>
     {name = b, typ = T, mixfix = mx, where_ = Option.map (apfst #2) wh});
 
-val assumes =
-  Parse.$$$ "assumes" |--
-    cut (Parse.and_list1
-      (name -- Parse.opt_attribs --| Parse.$$$ ":" -- cut (Scan.repeat1 Parse.propp)));
+val assumption = name -- Parse.opt_attribs --| Parse.$$$ ":" -- cut (Scan.repeat1 Parse.propp);
+
+(*each assumption is cut on its own: the one after "and" too*)
+val assumes = Parse.$$$ "assumes" |-- Parse.and_list1 (cut assumption);
 
 val header: header parser =
   cut Parse.type_args_constrained -- cut name --| cut (Parse.$$$ "=") --
@@ -170,22 +170,19 @@ fun read_assumptions thy name (assumes: (Attrib.binding * (string * string list)
     fun at ((a, _): Attrib.binding) = quote (Binding.name_of a) ^ Position.here (Binding.pos_of a);
     val _ = assumes |> List.app (fn (_, props) =>
       if forall (null o #2) props then () else error "Illegal term bindings in context element");
+    (*a name that comes again, with the assumption that used it first*)
     val _ =
-      (case duplicates (eq_fst (op =)) (map (fn (a, props) => (Binding.name_of (#1 a), (a, props))) assumes) of
-        (_, (a, _)) :: _ =>
-          let
-            val (first, props) =
-              the (find_first (fn (a', _) => Binding.name_of (#1 a') = Binding.name_of (#1 a)) assumes);
-          in
+      fold (fn (a, props) => fn seen =>
+        (case AList.lookup (op =) seen (Binding.name_of (#1 a)) of
+          SOME (first: Attrib.binding, props') =>
             error ("The name " ^ at a ^ " is already used by another assumption" ^
               Position.here (Binding.pos_of (#1 first)) ^ ": " ^
-              space_implode " " (map (quote o Input.string_of o Syntax.read_input o #1) props))
-          end
-      | [] => ());
+              space_implode " " (map (quote o Input.string_of o Syntax.read_input o #1) props'))
+        | NONE => (Binding.name_of (#1 a), (a, props)) :: seen)) assumes [];
     val parsed = map (map (Syntax.parse_prop ctxt o #1) o #2) assumes;
     (*the concept has no predicate yet: its name would be closed as a variable*)
     val _ = (assumes ~~ parsed) |> List.app (fn ((a, _), props) =>
-      if exists (exists_subterm (fn Free (x, _) => x = cname | _ => false)) props then
+      if exists (fn prop => member (op =) (Variable.add_free_names ctxt prop []) cname) props then
         error ("The assumption " ^ at a ^ " uses " ^ quote cname ^
           " itself, which is a circular reference")
       else ());
@@ -223,51 +220,63 @@ fun read_assumptions thy name (assumes: (Attrib.binding * (string * string list)
 
 (*what a conjunct of the predicate's definition says*)
 datatype kind =
-  Major             (*the major parent holds of the structure*)
-| View of string    (*the parent with this qualifier holds of its part of the structure*)
-| Edge              (*an assumption D S: another concept holds of the structure*)
-| Plain;            (*any other assumption*)
+  Major of string           (*this concept, the major parent, holds of the structure*)
+| View of string * string   (*the parent with this qualifier, this concept, holds of its part*)
+| Edge of string            (*an assumption D S: this concept holds of the structure*)
+| Plain;                    (*any other assumption*)
 
-(*concept: that of a parent; name: the fact, none for the rule to the base; rule: C ?S ==> ...*)
-type component = {kind: kind, concept: string option, name: string option, rule: thm};
+(*name: the theorem of the fact where the declaration stores the rule, as the attributes of its
+  assumption leave it; none for the rule to the base; rule: C ?S ==> ...*)
+type component = {kind: kind, name: Thm_Name.T option, rule: thm};
 
 (*def: C ?S == ...; components in the order of the definition; construction: ... ==> C ?S*)
 type concept = {name: string, def: thm, components: component list, construction: thm};
 
 (*from a concept to an ancestor: the number of steps, C ?S ==> A ?S, and the names of the rules
   of the steps, from C on, unless one of them has no name*)
-type entailment = {distance: int, entailment: thm, path: string list option};
+type entailment = {distance: int, entailment: thm, path: Thm_Name.T list option};
 
 fun map_concept f ({name, def, components, construction}: concept) : concept =
   {name = name, def = f def,
-   components = components |> map (fn {kind, concept, name, rule} =>
-     {kind = kind, concept = concept, name = name, rule = f rule}),
+   components = components |> map (fn {kind, name, rule} =>
+     {kind = kind, name = name, rule = f rule}),
    construction = f construction};
 
 fun map_entailment f ({distance, entailment, path}: entailment) : entailment =
   {distance = distance, entailment = f entailment, path = path};
 
-(*space: the names of the concepts; prefixes: by concept, the prefixes of the names of its
-  facts.  Theorems are stored without their theory*)
+(*prefixes: by concept, the prefixes under which its facts are stored, each with the number of
+  ancestors of the theory that stored facts under it.  Theorems are stored without their theory*)
 structure Data = Theory_Data
 (
   type T =
-   {space: Name_Space.T, concepts: concept Symtab.table,
-    entailments: entailment Symtab.table Symtab.table, prefixes: string list Symtab.table};
+   {concepts: concept Name_Space.table, entailments: entailment Symtab.table Symtab.table,
+    prefixes: (int * string) list Symtab.table};
   val empty =
-   {space = Name_Space.empty "concept", concepts = Symtab.empty, entailments = Symtab.empty,
+   {concepts = Name_Space.empty_table "concept", entailments = Symtab.empty,
     prefixes = Symtab.empty};
   fun merge
-     ({space, concepts, entailments, prefixes},
-      {space = space', concepts = concepts', entailments = entailments', prefixes = prefixes'}) =
-   {space = Name_Space.merge (space, space'),
-    concepts = Symtab.merge (K true) (concepts, concepts'),
+     ({concepts, entailments, prefixes},
+      {concepts = concepts', entailments = entailments', prefixes = prefixes'}) =
+   {concepts = Name_Space.merge_tables (concepts, concepts'),
     entailments = Symtab.merge (K true) (entailments, entailments'),
     prefixes = Symtab.merge_list (op =) (prefixes, prefixes')};
 );
 
+val unnamed = Binding.name "unnamed";
+
+(*a block of a concept stores its facts under the path of the concept, added to the naming of
+  the theory*)
+fun block_naming name = Name_Space.mandatory_path (Long_Name.base_name name);
+
+(*the prefix of these names, with the number of ancestors of the theory; for a theory with its
+  own naming, not that of a block*)
+fun block_prefix thy name =
+  (length (Context.ancestors_of thy),
+    Long_Name.qualifier (Name_Space.full_name (block_naming name (Sign.naming_of thy)) unnamed));
+
 fun get_concept thy name =
-  Symtab.lookup (#concepts (Data.get thy)) name |> Option.map (map_concept (Thm.transfer thy));
+  Name_Space.lookup (#concepts (Data.get thy)) name |> Option.map (map_concept (Thm.transfer thy));
 
 fun the_concept thy name =
   (case get_concept thy name of
@@ -284,6 +293,15 @@ fun entailment thy name ancestor =
   |> Option.mapPartial (fn tab => Symtab.lookup tab ancestor)
   |> Option.map (map_entailment (Thm.transfer thy));
 
+(*a concept with a type of its own has the rule C.equality and the constants C.truncate and
+  C.more*)
+fun owns_type thy name = #owner (Concept_Type.the_info thy name) = name;
+
+(*the approved text for the name a of a fact that the concept has by its declaration*)
+fun already_bound ctxt cname a th =
+  error ("The name " ^ quote a ^ " is already bound to the fact " ^ cname ^ "." ^ a ^ ": " ^
+    Thm.string_of_thm ctxt th ^ "\nUse a different name");
+
 (*run when a concept is declared, after its data are stored*)
 structure Declared = Hooks(type arg = string type state = theory);
 
@@ -299,7 +317,7 @@ fun conjuncts 1 th = [th]
 
 (*the entailments of a new concept from the rules to its direct parents, in header order: the
   shorter way wins, among equals the earlier parent*)
-fun entailments thy (steps: (string * string option * thm) list) =
+fun entailments thy (steps: (string * Thm_Name.T option * thm) list) =
   let
     fun step (parent, name, rule) =
       (parent, {distance = 1, entailment = rule, path = Option.map single name}) ::
@@ -314,34 +332,34 @@ fun entailments thy (steps: (string * string option * thm) list) =
   end;
 
 (*the predicate of the declared concept b over the structure S, with its definition, its rules
-  and its construction rule.  parents: the major parent with S, then the parents with a
-  qualifier with their terms; assumptions: closed propositions over S*)
-fun define b S (parents: (kind * string * term) list)
+  and its construction rule.  major: the concept of the major parent, which holds of S; views:
+  the parents with a qualifier, each with its concept and its part of S; assumptions: closed
+  propositions over S*)
+fun define b S major (views: (string * string * term) list)
     (assumptions: (Attrib.binding * term list) list) thy =
   let
     val name = Sign.full_name thy b;
     val cname = Binding.name_of b;
     val base = Concept_Type.base_name thy;
-    val owns = #owner (Concept_Type.the_info thy name) = name;
     val ctxt = Proof_Context.init_global thy |> Variable.declare_term S;
     val head = holds name S;
     fun at (a: binding) = quote (Binding.name_of a) ^ Position.here (Binding.pos_of a);
+    fun full a = Long_Name.append name a;
 
-    (* names *)
-
-    (*the facts of the parents; none for the rule to the base*)
-    fun parent_name (Major, P) = if P = base then NONE else SOME (Long_Name.base_name P)
-      | parent_name (View q, _) = SOME q
-      | parent_name _ = NONE;
+    (*the parents, the major one first: the name of the fact, none for the rule to the base;
+      what the conjunct says; the concept that holds of the part of S*)
+    val major_name = if major = base then NONE else SOME (Long_Name.base_name major);
+    val parents =
+      (major_name, Major major, holds major S) ::
+      map (fn (q, P, t) => (SOME q, View (q, P), holds P t)) views;
 
     (* definition *)
 
-    (*the propositions with the names of their facts: C.a, or C.a(i) where a has several*)
+    (*the propositions, each with the theorem of the fact of its assumption that it becomes*)
     val props =
       assumptions |> maps (fn ((a, _), ps) =>
-        map_index (fn (i, prop) =>
-          (a, Binding.name_of a ^ (if length ps = 1 then "" else "(" ^ string_of_int (i + 1) ^ ")"),
-            prop)) ps);
+        Thm_Name.make_list (full (Binding.name_of a), ps)
+        |> map (fn (thm_name, prop) => (a, thm_name, prop)));
     (*an assumption as a formula of HOL, with the equation between the two*)
     fun atomized (a, _, prop) =
       let val eq = Object_Logic.atomize ctxt (Thm.cterm_of ctxt prop) in
@@ -352,7 +370,7 @@ fun define b S (parents: (kind * string * term) list)
               quote (Syntax.string_of_term ctxt prop)))
       end;
     val atoms = map atomized props;
-    val body = foldr1 HOLogic.mk_conj (map (fn (_, P, t) => holds P t) parents @ map #1 atoms);
+    val body = foldr1 HOLogic.mk_conj (map #3 parents @ map #1 atoms);
     val (def, thy1) = thy
       |> Sign.declare_const_global ((b, fastype_of S --> \<^Type>\<open>bool\<close>), NoSyn) |> #2
       |> Global_Theory.add_def (Thm.def_binding b, Logic.mk_equals (head, body));
@@ -372,17 +390,15 @@ fun define b S (parents: (kind * string * term) list)
         SOME (Const (D, _) $ t) =>
           if t aconv S andalso is_some (Concept_Type.get_info thy1 D) then SOME D else NONE
       | _ => NONE);
-    fun full a = Long_Name.append name a;
-    val parent_components =
-      map2 (fn (kind, P, _) => fn th =>
-        {kind = kind, concept = SOME P, name = Option.map full (parent_name (kind, P)),
-         rule = global th}) parents parent_facts;
-    val assumption_components =
-      @{map 3} (fn (_, a, prop) => fn (_, eq) => fn th =>
-        {kind = if is_some (edge prop) then Edge else Plain, concept = edge prop,
-         name = SOME (full a), rule = global (Thm.equal_elim (Thm.symmetric eq) th)})
+    val parent_components : component list =
+      map2 (fn (a, kind, _) => fn th =>
+        {kind = kind, name = Option.map (rpair 0 o full) a, rule = global th})
+        parents parent_facts;
+    val assumption_components : component list =
+      @{map 3} (fn (_, thm_name, prop) => fn (_, eq) => fn th =>
+        {kind = (case edge prop of SOME D => Edge D | NONE => Plain), name = SOME thm_name,
+         rule = global (Thm.equal_elim (Thm.symmetric eq) th)})
         props atoms atom_facts;
-    val components : component list = parent_components @ assumption_components;
 
     (* the truncate congruence rule of the predicate: C (P.truncate t) = C t *)
 
@@ -411,9 +427,8 @@ fun define b S (parents: (kind * string * term) list)
         | NONE => plain)
       end;
     val premises =
-      map (fn (kind, P, t) =>
-        (case kind of View _ => (HOLogic.mk_Trueprop (holds P t), I) | _ => on_structure P))
-        parents @
+      on_structure major ::
+      map (fn (_, P, t) => (HOLogic.mk_Trueprop (holds P t), I)) views @
       map2 (fn (_, _, prop) => fn (_, eq) =>
         (case edge prop of
           SOME D => on_structure D
@@ -430,47 +445,53 @@ fun define b S (parents: (kind * string * term) list)
 
     (* facts *)
 
-    val steps =
-      components |> map_filter (fn {kind, concept = SOME P, name, rule} =>
-        (case kind of View _ => NONE | Plain => NONE | _ => SOME (P, name, rule)) | _ => NONE);
-    val table = entailments thy2 steps;
+    (*the assumptions first, as their attributes leave them*)
+    val (stored, thy3) = thy2
+      |> Attrib.global_notes ""
+        (map2 (fn ((a, atts), _) => fn cs =>
+            ((Binding.qualify true cname a, atts), [(map #rule cs, [])]))
+          assumptions (unflat (map #2 assumptions) assumption_components));
+    (*the steps to the direct parents: the major parent, then the edges.  The fact of an edge
+      names its step unless an attribute has made another theorem of it*)
+    val edges =
+      (assumption_components ~~ maps #2 stored) |> map_filter
+        (fn ({kind = Edge D, name, rule}, th) =>
+            SOME (D, if Thm.eq_thm_prop (rule, th) then name else NONE, rule)
+          | _ => NONE);
+    val {name = major_fact, rule = major_rule, ...} = hd parent_components;
+    val table = entailments thy3 ((major, major_fact, major_rule) :: edges);
     val to_base = #entailment (the (Symtab.lookup table base));
     val equality =
-      if owns then
-        Concept_Type.equality thy2 name |> Option.map (fn th =>
+      if owns_type thy3 name then
+        Concept_Type.equality thy3 name |> Option.map (fn th =>
           ((Binding.qualify_name true b "equality", []), [([th OF [to_base, to_base]], [])]))
       else NONE;
     val parent_notes =
-      map2 (fn (kind, P, _) => fn {rule, ...}: component =>
-        parent_name (kind, P) |> Option.map (fn a =>
-          ((Binding.qualify_name true b a, []), [([rule], [])]))) parents parent_components;
-    val assumption_notes =
-      (assumptions ~~ unflat (map #2 assumptions) assumption_components)
-      |> map (fn (((a, atts), _), cs) =>
-        ((Binding.qualify true cname a, atts), [(map #rule cs, [])]));
+      map2 (fn (a, _, _) => fn {rule, ...}: component =>
+        a |> Option.map (fn a' => ((Binding.qualify_name true b a', []), [([rule], [])])))
+        parents parent_components;
     (*an assumption with the name of a fact that the concept has anyway*)
     val _ = assumptions |> List.app (fn ((a, _), _) =>
       (case find_first (fn ((a', _), _) => Binding.name_of a' = Binding.name_of a)
           (map_filter I parent_notes @ the_list equality) of
         SOME (_, (th :: _, _) :: _) =>
-          error ("The name " ^ quote (Binding.name_of a) ^ " is already bound to the fact " ^
-            cname ^ "." ^ Binding.name_of a ^ ": " ^
-            Thm.string_of_thm (Proof_Context.init_global thy2) th ^ "\nUse a different name")
+          already_bound (Proof_Context.init_global thy3) cname (Binding.name_of a) th
       | _ => ()));
     val concept : concept =
-      {name = name, def = def, components = components, construction = construction};
-    val thy3 = thy2
-      |> Attrib.global_notes "" (map_filter I parent_notes @ assumption_notes @ the_list equality)
-      |> #2
+      {name = name, def = def, components = parent_components @ assumption_components,
+       construction = construction};
+    val thy4 = thy3
+      |> Attrib.global_notes "" (map_filter I parent_notes @ the_list equality) |> #2
       |> Concept.add_predicate name name
-      |> (fn thy' => thy' |> Data.map (fn {space, concepts, entailments, prefixes} =>
-          {space = #2 (Name_Space.declare (Context.Theory thy') true b space),
-           concepts = Symtab.update (name, map_concept Thm.trim_context concept) concepts,
+      |> (fn thy' => thy' |> Data.map (fn {concepts, entailments, prefixes} =>
+          {concepts =
+             #2 (Name_Space.define (Context.Theory thy') true
+               (b, map_concept Thm.trim_context concept) concepts),
            entailments =
              Symtab.update (name, Symtab.map (K (map_entailment Thm.trim_context)) table)
                entailments,
-           prefixes = Symtab.insert_list (op =) (name, name) prefixes}));
-  in (concept, Declared.invoke (Context.Theory thy3) name thy3) end;
+           prefixes = Symtab.insert_list (op =) (name, block_prefix thy' name) prefixes}));
+  in (concept, Declared.invoke (Context.Theory thy4) name thy4) end;
 
 (*the concept of a header: its type, then its predicate*)
 fun declare (header as {name = b, assumes, ...}: header) thy =
@@ -480,51 +501,62 @@ fun declare (header as {name = b, assumes, ...}: header) thy =
       map (apfst (apsnd (map (Attrib.check_src (Proof_Context.init_global thy1))))) assumes;
     val (S, assumptions) = read_assumptions thy1 name assumes';
     val ctxt1 = Proof_Context.init_global thy1 |> Variable.declare_term S;
-    val major =
-      (Major, (case parent of SOME (_, P) => P | NONE => Concept_Type.base_name thy1), S);
+    val major = (case parent of SOME (_, P) => P | NONE => Concept_Type.base_name thy1);
+    (*a parent with the name of a rule that the concept has anyway: that of the first parent,
+      or equality where the concept has a type of its own*)
+    fun reserved q =
+      if is_some parent andalso q = Long_Name.base_name major then SOME "the base"
+      else if q = "equality" andalso owns_type thy1 name then SOME "a fact"
+      else NONE;
+    val _ =
+      #items header |> List.app (fn {name = x, ...}: item =>
+        let val q = Binding.name_of x in
+          (case (exists (fn {qualifier, ...} => qualifier = q) views, reserved q) of
+            (true, SOME what) =>
+              error ("You cannot name a field as " ^ quote q ^ Position.here (Binding.pos_of x) ^
+                " as the name " ^ quote q ^ " is reserved for " ^ what ^ " of the concept " ^
+                quote (Binding.name_of b))
+          | _ => ())
+        end);
     val qualified =
       views |> map (fn {name = c, qualifier, parent = (_, P), ...} =>
-        (View qualifier, P, Syntax.check_term ctxt1 (Const (c, dummyT) $ S)));
-  in define b S (major :: qualified) assumptions thy1 end;
+        (qualifier, P, Syntax.check_term ctxt1 (Const (c, dummyT) $ S)));
+  in define b S major qualified assumptions thy1 end;
 
 
 (** the block **)
 
 (* the lookup chain *)
 
-(*the prefixes under which the facts of the concept are stored, one for each theory that stored
-  one: that of a theory with more ancestors first*)
-fun prefixes thy name =
-  Symtab.lookup_list (#prefixes (Data.get thy)) name
-  |> sort (prod_ord (rev_order o int_ord) string_ord o apply2 (fn prefix =>
-      let val T = Long_Name.qualifier prefix in
-        (case try (Context.get_theory {long = true} thy) T of
-          SOME thy' => (length (Context.ancestors_of thy'), prefix)
-        | NONE => (0, prefix))
-      end));
+(*the order among the prefixes of one concept: that of a theory with more ancestors first, so a
+  theory before those it imports; then by name*)
+val sorted_prefixes = sort (prod_ord (rev_order o int_ord) string_ord) #> map #2;
 
-(*the prefixes that resolve a short name in the block of the concept: its own, then those of its
-  ancestors, the nearer first*)
+fun stored_prefixes thy name = Symtab.lookup_list (#prefixes (Data.get thy)) name;
+
+(*the prefixes that resolve a short name in the block of the concept: its own, that of the
+  block first, which is there before the block stores a fact; then those of its ancestors, the
+  nearer first*)
 fun qualifiers thy name =
   let
     val base = Concept_Type.base_name thy;
     val chain =
       ancestors thy name |> filter_out (fn (a, _) => a = base)
       |> sort (int_ord o apply2 (#distance o #2)) |> map #1;
-  in maps (prefixes thy) (name :: chain) end;
+    val (_, own) = block_prefix thy name;
+  in
+    own :: remove (op =) own (sorted_prefixes (stored_prefixes thy name)) @
+    maps (sorted_prefixes o stored_prefixes thy) chain
+  end;
 
 
 (* what a block fixes and assumes *)
 
+(*the structure, and that the concept holds of it, with the name of this fact*)
 fun elements thy name =
-  let
-    val {scheme, ...} = Concept_Type.the_info thy name;
-    val ctxt = Proof_Context.init_global thy |> Variable.declare_typ scheme;
-    val ([s], _) = Proof_Context.add_fixes [(Binding.name "\<S>", SOME scheme, NoSyn)] ctxt;
-  in
-    ((Binding.name s, scheme),
-      (Binding.name (Long_Name.base_name name ^ "_axioms"),
-        HOLogic.mk_Trueprop (holds name (Free (s, scheme)))))
+  let val S = Free ("\<S>", #scheme (Concept_Type.the_info thy name)) in
+    {S = S, axioms = Binding.name (Long_Name.base_name name ^ "_axioms"),
+     assumption = HOLogic.mk_Trueprop (holds name S)}
   end;
 
 
@@ -541,7 +573,7 @@ fun shift_consumes n th =
   other theorem, which takes the stock export*)
 fun redeclared name lthy =
   if Local_Theory.redeclaring lthy then
-    let val A = Thm.cterm_of lthy (#2 (#2 (elements (Proof_Context.theory_of lthy) name))) in
+    let val A = Thm.cterm_of lthy (#assumption (elements (Proof_Context.theory_of lthy) name)) in
       fn th =>
         let val hyps = Thm.chyps_of th in
           if null hyps then SOME th
@@ -556,15 +588,13 @@ fun redeclared name lthy =
   context a premise; a theorem stored as it is takes the same export with the assumptions put
   aside, which only makes the fixed variables schematic.  A result just proved has all the
   assumptions as hyps or only those it uses, as its proof was forked or not*)
-fun export name (name_pos, th) lthy =
-  (case redeclared name lthy th of
+fun export redeclared (name_pos, th) lthy =
+  (case redeclared th of
     SOME th' =>
       Local_Theory.global_form_result (Generic_Target.thm_definition (name_pos, th')) lthy
       |>> (fn (_, global) =>
         (Global_Theory.name_thm Global_Theory.unofficial2 name_pos th, Rule_Cases.save th' global))
   | NONE => Generic_Target.thm_definition (name_pos, th) lthy);
-
-val unnamed = Binding.name "unnamed";
 
 (*the entries that partial evaluation makes of each fact, in order: the declarations that it
   splits off, if any, then the entry with the binding of the fact*)
@@ -578,10 +608,51 @@ fun regroup facts evaluated =
       let val (decls, (_, fact)) = split_last group in decls @ [((b, []), fact)] end;
   in map2 rebind facts (rev groups) end;
 
+(*the facts that the declaration of a concept made, each with whether the system chose its
+  name: equality and the rules of the parents; the user wrote the names of the assumptions*)
+fun declared_facts thy name =
+  (if owns_type thy name then [(Long_Name.append name "equality", true)] else []) @
+  (#components (the_concept thy name) |> map_filter (fn {kind, name = thm_name, ...} =>
+    thm_name |> Option.map (fn (a, _) =>
+      (a, (case kind of Major _ => true | View _ => true | _ => false)))));
+
+(*a fact of a block with the name of one that the declaration of the concept made.  With its
+  very name: the approved error where the system chose the name; where the user wrote it,
+  storing the fact reports the duplicate.  Under another prefix the new fact hides that of the
+  declaration: a warning*)
+fun check_fact_names name facts lthy =
+  let
+    val thy = Proof_Context.theory_of lthy;
+    val declared = declared_facts thy name;
+    val cname = Long_Name.base_name name;
+  in
+    facts |> List.app (fn ((b, _), _) =>
+      let
+        val a = Local_Theory.full_name lthy b;
+        val a' = Long_Name.append name (Binding.long_name_of b);
+      in
+        (case AList.lookup (op =) declared a' of
+          NONE => ()
+        | SOME by_system =>
+            if a = a' then
+              if by_system then
+                already_bound lthy cname (Binding.name_of b) (Global_Theory.get_thm thy a)
+              else ()
+            else if Context_Position.is_visible lthy then
+              warning ("The theorem name " ^ quote (Binding.name_of b) ^
+                Position.here (Binding.pos_of b) ^ " hides the existing fact " ^ cname ^ "." ^
+                Binding.name_of b ^
+                Position.here (Name_Space.the_entry_pos (Global_Theory.fact_space thy) a'))
+            else ())
+      end)
+  end;
+
 (*the facts of a block are stored in the theory in their global forms and bound nowhere else;
   the caller gets the local forms, as from the stock notes*)
 fun notes name kind facts lthy =
   let
+    val _ = check_fact_names name facts lthy;
+    val thy = Proof_Context.theory_of lthy;
     (*the attributes once, in the block: those that change a theorem act on the statement as it
       is handed in; the others stay, for the theorem that is stored*)
     val groups =
@@ -590,10 +661,11 @@ fun notes name kind facts lthy =
       |> map (apfst (apfst (fn b => if Binding.is_empty b then unnamed else b)))
       |> Attrib.partial_evaluation lthy
       |> regroup facts;
+    val export = export (redeclared name lthy);
     val (exported, lthy1) =
       (flat groups, lthy) |-> fold_map (fn (a, thms) => fn lthy' =>
         let val thms' = Thm_Name.expr (Local_Theory.full_name_pos lthy' (#1 a)) thms
-        in lthy' |> fold_map (fn (args, atts) => fold_map (export name) args #>> rpair atts) thms'
+        in lthy' |> fold_map (fn (args, atts) => fold_map export args #>> rpair atts) thms'
           |>> pair a end);
     val local_facts = Attrib.map_thms #1 exported;
     (*what the caller gets: the local forms with the remaining attributes applied, in a copy of
@@ -601,13 +673,13 @@ fun notes name kind facts lthy =
     val local_results =
       #1 (Attrib.local_notes kind local_facts (Context_Position.not_really lthy1));
     val global_facts = Attrib.map_thms #2 exported;
-    (*the prefix of the names, for the lookup chain*)
-    val prefix = Long_Name.qualifier (Local_Theory.full_name lthy unnamed);
+    (*with the prefix of the block, for the lookup chain of later blocks*)
+    val prefix = block_prefix thy name;
     val (stored, lthy2) =
       lthy1 |> Local_Theory.background_theory_result
         (Attrib.global_notes kind global_facts
-          ##> Data.map (fn {space, concepts, entailments, prefixes} =>
-            {space = space, concepts = concepts, entailments = entailments,
+          ##> Data.map (fn {concepts, entailments, prefixes} =>
+            {concepts = concepts, entailments = entailments,
              prefixes = Symtab.insert_list (op =) (name, prefix) prefixes}));
     (*what the remaining attributes declare, at every level, for the theorems that are stored*)
     val declared = map (apfst (K Binding.empty_atts)) global_facts;
@@ -623,37 +695,42 @@ fun notes name kind facts lthy =
 (*the standard morphism from the working context to a target context, the theory or a level of
   the block, except that a theorem that is stored as it is goes to every target in its global
   form: the one theorem that notes would store*)
-fun block_morphism name lthy ctxt =
-  let
-    val phi = Local_Theory.standard_morphism lthy ctxt;
-    val thy_ctxt = Proof_Context.init_global (Proof_Context.theory_of lthy);
-    val (as_it_is, _) =
-      lthy |> Local_Theory.global_form_result (fn lthy' =>
-        (Local_Theory.standard_morphism lthy' thy_ctxt, lthy'));
-    val redeclared = redeclared name lthy;
-  in
-    Morphism.morphism "Concept_Package.block_morphism"
-     {binding = [K (Morphism.binding phi)],
-      typ = [K (Morphism.typ phi)],
-      term = [K (Morphism.term phi)],
-      fact = [K (map (fn th =>
-        (case redeclared th of
-          SOME th' => Rule_Cases.save th' (Morphism.thm as_it_is th')
-        | NONE => Morphism.thm phi th)))]}
-    |> Morphism.set_context' lthy
-  end;
+fun block_morphism name lthy =
+  if Local_Theory.redeclaring lthy then
+    let
+      val thy_ctxt = Proof_Context.init_global (Proof_Context.theory_of lthy);
+      val (as_it_is, _) =
+        lthy |> Local_Theory.global_form_result (fn lthy' =>
+          (Local_Theory.standard_morphism lthy' thy_ctxt, lthy'));
+      val redeclared = redeclared name lthy;
+    in
+      fn ctxt =>
+        let val phi = Local_Theory.standard_morphism lthy ctxt in
+          Morphism.morphism "Concept_Package.block_morphism"
+           {binding = [K (Morphism.binding phi)],
+            typ = [K (Morphism.typ phi)],
+            term = [K (Morphism.term phi)],
+            fact = [K (map (fn th =>
+              (case redeclared th of
+                SOME th' => Rule_Cases.save th' (Morphism.thm as_it_is th')
+              | NONE => Morphism.thm phi th)))]}
+          |> Morphism.set_context' lthy
+        end
+    end
+  else Local_Theory.standard_morphism lthy;
 
 (*the data of a package go to the theory and to every level of the block, as in the stock theory
   target; they are not replayed when the block is opened again*)
 fun declaration name (_: {syntax: bool, pervasive: bool, pos: Position.T}) decl lthy =
-  lthy
-  |> Local_Theory.background_theory (Context.theory_map (fn context =>
-      Morphism.form (Morphism.transform
-        (block_morphism name lthy (Proof_Context.init_global (Context.theory_of context))) decl)
-        context))
-  |> Local_Theory.map_contexts (fn _ => fn ctxt =>
-      Context.proof_map
-        (Morphism.form (Morphism.transform (block_morphism name lthy ctxt) decl)) ctxt);
+  let val phi = block_morphism name lthy in
+    lthy
+    |> Local_Theory.background_theory (Context.theory_map (fn context =>
+        Morphism.form
+          (Morphism.transform (phi (Proof_Context.init_global (Context.theory_of context))) decl)
+          context))
+    |> Local_Theory.map_contexts (fn _ => fn ctxt =>
+        Context.proof_map (Morphism.form (Morphism.transform (phi ctxt) decl)) ctxt)
+  end;
 
 
 (* define and abbrev *)
@@ -672,15 +749,24 @@ fun defined name (b, mx) lhs lthy =
   else
     Defined.invoke (Context.Proof lthy) {concept = name, binding = b, mixfix = mx, lhs = lhs} lthy;
 
+(*a concept with a type of its own has the constant truncate*)
+fun check_constant name b lthy =
+  if Binding.name_of b = "truncate" andalso owns_type (Proof_Context.theory_of lthy) name then
+    error ("The constant name \"truncate\" is already bound to the constant " ^
+      Long_Name.base_name name ^ ".truncate")
+  else lthy;
+
 (*the constant of the theory as in a theory target, but the levels of the block get no
   abbreviation for its short name, and the theory no mixfix: both are left to those that listen.
   The local name that the stock lifting binds lasts until the end of the command*)
 fun foundation name (((b, U), mx), (b_def, rhs)) params =
-  Generic_Target.background_foundation (((b, U), NoSyn), (b_def, rhs)) params
+  check_constant name b
+  #> Generic_Target.background_foundation (((b, U), NoSyn), (b_def, rhs)) params
   #-> (fn (lhs, def) => defined name (b, mx) lhs #> pair (lhs, def));
 
 fun target_abbrev name prmode (b, mx) global_rhs (_, term_params) =
-  Local_Theory.background_theory_result (Sign.add_abbrev (#1 prmode) (b, global_rhs))
+  check_constant name b
+  #> Local_Theory.background_theory_result (Sign.add_abbrev (#1 prmode) (b, global_rhs))
   #-> (fn (lhs, _) =>
     defined name (b, mx) (Term.list_comb (Logic.unvarify_global lhs, term_params)));
 
@@ -690,30 +776,31 @@ fun target_abbrev name prmode (b, mx) global_rhs (_, term_params) =
 fun target name : Named_Target.other_target =
   let
     val cname = Long_Name.base_name name;
+    fun fixes S = let val (s, T) = dest_Free S in [(Binding.name s, SOME T, NoSyn)] end;
     fun setup thy =
-      let val ((s, T), (axioms, prop)) = elements thy name in
+      let val {S, axioms, assumption} = elements thy name in
         Proof_Context.init_global thy
-        |> Variable.declare_typ T
-        |> Proof_Context.add_fixes [(s, SOME T, NoSyn)] |> #2
+        |> Variable.declare_term S
+        |> Proof_Context.add_fixes (fixes S) |> #2
         |> Proof_Context.add_assms Assumption.assume_export
-            [((axioms, [Classical.safe_intro NONE]), [(prop, [])])] |> #2
+            [((axioms, [Classical.safe_intro NONE]), [(assumption, [])])] |> #2
         |> Proof_Context.put_default_fact_qualifiers (qualifiers thy name)
       end;
     fun pretty lthy =
       let
         val thy = Proof_Context.theory_of lthy;
-        val ((s, T), (axioms, prop)) = elements thy name;
+        val {S, axioms, assumption} = elements thy name;
         val ctxt = Proof_Context.init_global thy;
       in
         [Pretty.block (Pretty.keyword1 "concept" :: Pretty.brk 1 :: Pretty.str cname ::
           maps (fn elem => [Pretty.fbrk, Pretty.chunks (Element.pretty_ctxt ctxt elem)])
-           [Element.Fixes [(s, SOME T, NoSyn)],
-            Element.Assumes [((axioms, []), [(prop, [])])]])]
+           [Element.Fixes (fixes S),
+            Element.Assumes [((axioms, []), [(assumption, [])])]])]
       end;
     fun not_possible command hint _ =
       error (command ^ " cannot be used in concept " ^ cname ^ hint);
   in
-    {naming = Name_Space.mandatory_path cname,
+    {naming = block_naming name,
      setup = setup,
      operations =
       {define = Generic_Target.define (foundation name),
@@ -735,9 +822,10 @@ fun target name : Named_Target.other_target =
 val _ =
   Theory.setup (Context.theory_map (Named_Target.Other_Target.add 0 (fn (thy, (xname, _)) =>
     fn NONE =>
-        let val name = Name_Space.intern (#space (Data.get thy)) xname in
-          if Symtab.defined (#concepts (Data.get thy)) name then SOME (target name) else NONE
-        end
+        let
+          val concepts = #concepts (Data.get thy);
+          val name = Name_Space.intern (Name_Space.space_of_table concepts) xname;
+        in if Name_Space.defined concepts name then SOME (target name) else NONE end
       | some => some)));
 
 
@@ -749,10 +837,9 @@ fun pretty_constants thy ({name = b, items, ...}: header) =
   let
     val name = Sign.full_name thy b;
     val ctxt = Proof_Context.init_global thy;
-    val {owner, ...} = Concept_Type.the_info thy name;
     val consts =
       name :: map (fn {name = x, ...} => Long_Name.append name (Binding.name_of x)) items @
-      (if owner = name then map (Long_Name.append name) ["truncate", "more"] else []);
+      (if owns_type thy name then map (Long_Name.append name) ["truncate", "more"] else []);
     fun line c =
       Pretty.block
        [Pretty.str "  ", Pretty.str (Proof_Context.extern_const ctxt c), Pretty.str " ::",
