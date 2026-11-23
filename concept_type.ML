@@ -56,6 +56,10 @@ sig
   val declare_base: theory -> theory
   val declare: {name: binding, args: (string * sort) list, parent: parent option,
     items: item list} -> theory -> info * theory
+  val mk_truncate: theory -> string -> term -> term
+  val extra_type_variables: string -> (string * sort) list -> 'a
+  val header_context: theory -> string ->
+    {context: Proof.context, S: term, substitution: (string * term) list}
   val define_instance: Proof.context ->
     {family: string option, name: binding, define: bool, concept: parent, params: term list,
      where_: ((string * Position.T) list * string) list, constraint: term} ->
@@ -3044,6 +3048,7 @@ fun declare_base thy =
   in
     thy'
     |> map_data (fn (_, entries, owners, instances) => (SOME name, entries, owners, instances))
+    |> Concept.add_predicate name name
     |> add_laws name
     |> add_base_equality
     |> add_equality name
@@ -3073,6 +3078,12 @@ fun check_parent thy cname (Ts, name) =
           Syntax.string_of_sort_global thy S ^ ", as the type parameter " ^ a ^ " of " ^
           quote bname ^ " requires"));
   in () end;
+
+(*type variables in the declaration of the concept cname that are no type parameters of it*)
+fun extra_type_variables cname extra =
+  error ("Extra " ^ plural extra "type variable" ^ " " ^ commas (map #1 extra) ^
+    " in concept " ^ quote cname ^
+    ": every type variable must be a type parameter of the concept");
 
 fun check_declaration thy b args parent items =
   let
@@ -3116,10 +3127,7 @@ fun check_declaration thy b args parent items =
           | View {parent = (Ts, _), more, ...} => fold Term.add_tfreesT (Ts @ [more])) items
         (fold Term.add_tfreesT (#1 parent) []));
     val extra = subtract (op =) args tfrees;
-    val _ = null extra orelse
-      error ("Extra " ^ plural extra "type variable" ^ " " ^ commas (map #1 extra) ^
-        " in concept " ^ quote cname ^
-        ": every type variable must be a type parameter of the concept");
+    val _ = null extra orelse extra_type_variables cname extra;
   in () end;
 
 (*every type parameter occurs in the scheme type: in the major parent's type arguments or in
@@ -3171,6 +3179,41 @@ fun layer_leaves [] _ _ = ([], [])
       end
   | layer_leaves (View _ :: _) [] _ = raise Match;
 
+(*the context in which the terms of a header of the concept are read: S, every named field and
+  every view among the children is a variable, and so is each of pending, the views that are
+  not defined yet; with what the variables that are defined stand for*)
+fun reading_context thy name children pending =
+  let
+    val {args, scheme = sT, ...} = the_entry thy name;
+    val p_C = (map TFree args, name);
+    val fields =
+      flat_leaves thy p_C |> map_index I |> map_filter (fn (i, {name = SOME c, typ, ...}) =>
+        SOME (Long_Name.base_name c, typ, i) | _ => NONE);
+    val defined =
+      children |> map_filter (fn (x, (View_Child {const, parent, more, ...}, _)) =>
+        SOME (x, const, scheme_type thy parent more) | _ => NONE);
+    val ctxt0 = Proof_Context.init_global thy |> fold (Variable.declare_typ o TFree) args;
+    val ([s_name], ctxt1) = Proof_Context.add_fixes [(Binding.name "\<S>", SOME sT, NoSyn)] ctxt0;
+    val S = Free (s_name, sT);
+    val (field_names, ctxt2) =
+      Proof_Context.add_fixes (map (fn (x, T, _) => (Binding.name x, SOME T, NoSyn)) fields) ctxt1;
+    val (defined_names, ctxt3) = Proof_Context.add_fixes
+      (map (fn (x, _, T) => (Binding.name x, SOME T, NoSyn)) defined) ctxt2;
+    val (pending_names, ctxt) = Proof_Context.add_fixes pending ctxt3;
+    val substitution =
+      (s_name, S) ::
+      map2 (fn x => fn (_, _, i) => (x, read_leaf thy p_C i S)) field_names fields @
+      map2 (fn x => fn (_, c, _) => (x, app thy c S)) defined_names defined;
+  in {context = ctxt, S = S, substitution = substitution, pending = pending_names} end;
+
+(*the same for a concept that is declared*)
+fun header_context thy name =
+  let
+    val {args, ...} = the_entry thy name;
+    val {context, S, substitution, ...} =
+      reading_context thy name (children thy (map TFree args, name)) [];
+  in {context = context, S = S, substitution = substitution} end;
+
 fun declare {name = b, args, parent, items} thy0 =
   let
     val parent' = the_default ([], base_name thy0) parent;
@@ -3211,29 +3254,14 @@ fun declare {name = b, args, parent, items} thy0 =
         end
       else add_layer b args (SOME parent') bleaves thy0;
 
-    (* the context of the right-hand sides: S, every field and every view is a variable *)
+    (* the context of the right-hand sides: the views of this declaration are not defined yet *)
     val sT = #scheme (the_entry thy1 name);
     val leaves_C = flat_leaves thy1 p_C;
-    val inherited_views =
-      children thy1 parent' |> map_filter (fn (x, (View_Child {const, parent, more, ...}, _)) =>
-        SOME (x, const, scheme_type thy1 parent more) | _ => NONE);
-    val fields =
-      leaves_C |> map_index I |> map_filter (fn (i, {name = SOME c, typ, ...}) =>
-        SOME (Long_Name.base_name c, typ, i) | _ => NONE);
-    val ctxt0 = Proof_Context.init_global thy1 |> fold (Variable.declare_typ o TFree) args;
-    val ([s_name], ctxt1) = Proof_Context.add_fixes [(Binding.name "\<S>", SOME sT, NoSyn)] ctxt0;
-    val S = Free (s_name, sT);
-    val (field_names, ctxt2) =
-      Proof_Context.add_fixes (map (fn (x, T, _) => (Binding.name x, SOME T, NoSyn)) fields) ctxt1;
-    val (inherited_names, ctxt3) = Proof_Context.add_fixes
-      (map (fn (x, _, T) => (Binding.name x, SOME T, NoSyn)) inherited_views) ctxt2;
-    val (view_names, ctxt) = Proof_Context.add_fixes
-      (views |> map (fn {qualifier, parent = p, more, ...} =>
-        (qualifier, SOME (scheme_type thy1 p more), NoSyn))) ctxt3;
-    val base_subst =
-      (s_name, S) ::
-      map2 (fn x => fn (_, _, i) => (x, read_leaf thy1 p_C i S)) field_names fields @
-      map2 (fn x => fn (_, c, _) => (x, app thy1 c S)) inherited_names inherited_views;
+    val {context = ctxt, S, substitution = base_subst, pending = view_names} =
+      reading_context thy1 name (children thy1 parent')
+        (views |> map (fn {qualifier, parent = p, more, ...} =>
+          (qualifier, SOME (scheme_type thy1 p more), NoSyn)));
+    val s_name = #1 (dest_Free S);
 
     fun read_entry idx qname view_consts (entry as (path, _, given)) =
       let
@@ -3427,6 +3455,10 @@ fun define_instance ctxt
       Term.add_frees t [] |> List.app (fn (x, _) =>
         if member (op =) param_names x then () else undefined_constant field x);
 
+    (*the type variables of the constant are declared: type inference gives a type left open
+      another name*)
+    val ctxt = Variable.declare_typ (paramTs ---> unit_type thy p_D) ctxt;
+
     (* the member of the family that the instance continues *)
     fun part layer p =
       unit_type thy (the (find_first (fn (_, c) => c = layer) (major_chain thy p)));
@@ -3458,9 +3490,12 @@ fun define_instance ctxt
           handle Type.TYPE_MATCH => type_error ();
         val m = Envir.subst_term_types tyenv o Logic.varify_types_global;
         val values = map (instance_subst m src params) (take (leaf_count thy layer) (#values src));
+        (*a type variable that only the more of the member has is left open by the match*)
+        val more =
+          the_single (#1 (Variable.importT_terms [instance_subst m src params (#more src)] ctxt));
       in
         {entry = src, source = (Family, layer, list_comb (m const, params)),
-         values = map_index I values, more = instance_subst m src params (#more src)}
+         values = map_index I values, more = more}
       end;
     fun continued () =
       family |> Option.mapPartial (fn f =>
@@ -3472,9 +3507,6 @@ fun define_instance ctxt
 
     (* more: that of the result; else given by where clauses, the first of them fixing its
        type; else () *)
-    (*the type variables of the constant are declared: type inference gives a type left open
-      another name*)
-    val ctxt = Variable.declare_typ (paramTs ---> unit_type thy p_D) ctxt;
     val first_more =
       (case (result, more_clauses) of
         (NONE, (_, rhs) :: _) => SOME (Syntax.read_term ctxt rhs)
