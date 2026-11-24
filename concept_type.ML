@@ -3021,11 +3021,12 @@ fun truncate_eq_fixed ctxt {concept, s, t} =
               Vartab.build (Term.add_vars s [] |> fold (fn (xi, T) =>
                 Vartab.update (xi, (T, #2 (the (Vartab.lookup tenv xi)))))));
           fun result extra known =
-            {env = env', extra = extra,
+            {env = env', extra = Option.map Envir.beta_eta_contract extra,
              eq = Lazy.lazy (fn () =>
               prove_truncate_eq ctxt inst known top
               |> (case extra of SOME u => Thm.implies_intr (concept_prop u) | NONE => I)
-              |> Thm.implies_intr (concept_prop s')),
+              |> Thm.implies_intr (concept_prop s')
+              |> Conv.fconv_rule Drule.beta_eta_conversion),
              reached = legal (legal_from [t]) s'};
           val from_s = legal_from [s'];
         in
@@ -3037,9 +3038,10 @@ fun truncate_eq_fixed ctxt {concept, s, t} =
         end)
   end;
 
-(*concept s' ==> O.truncate s' = O.truncate t, or with a second premise concept t (extra), for
-  the layer O owning the type of the concept, and s' the instance of s under env; reached:
-  concept t gives concept s'.  The variables of s are apart from those of t, which stay*)
+(*concept s' ==> O.truncate s' = O.truncate t', or with a second premise concept t' (extra),
+  for the layer O owning the type of the concept and the beta-eta normal forms s' of s under env
+  and t' of t: the equation is in beta-eta normal form.  reached: concept t gives concept s'.
+  The variables of s are apart from those of t, which stay*)
 fun truncate_eq ctxt (arg as {concept, s, t}) =
   if Term.maxidx_of_term t = ~1 then truncate_eq_fixed ctxt arg
   else
