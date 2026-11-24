@@ -41,6 +41,7 @@ sig
     {env: Type.tyenv * Envir.tenv, eq: thm lazy, extra: term option, reached: bool} option
   val add_implication: string -> thm -> theory -> theory
   val super_param: theory -> string -> int option
+  val key_of: theory -> term -> string option
   val linked_keys: theory -> string -> string list
   type covering = {layer: string, member: string, exact: bool}
   val own_layer: theory -> {family: string, concept: string} -> string * covering option
@@ -52,11 +53,13 @@ sig
   val derive_truncate_cong: Proof.context -> {const: term, def: thm, position: int} ->
     cong_rule option
   val in_selector_simp: Proof.context -> bool
+  val trace: bool Config.T
   val selector_rewrite: Proof.context -> cterm -> thm option
   val selector_conv: Proof.context -> conv
   val selector_simp_tac: Proof.context -> thm list -> int -> tactic
   val selector_simplify: Proof.context -> thm -> thm option
   val map_selector_simpset: (Proof.context -> Proof.context) -> Context.generic -> Context.generic
+  val may_rewrite: Proof.context -> term -> bool
   val selector_equation: Proof.context -> term -> thm option
   val source_equation: Proof.context -> term -> thm option
   val concept_holds: Proof.context -> term -> thm option
@@ -68,6 +71,7 @@ sig
   val declare: {name: binding, args: (string * sort) list, parent: parent option,
     items: item list} -> theory -> info * theory
   val mk_truncate: theory -> string -> term -> term
+  val dest_truncation: theory -> term -> (string * term) option
   val extra_type_variables: string -> (string * sort) list -> 'a
   val header_context: theory -> string ->
     {context: Proof.context, S: term, substitution: (string * term) list}
@@ -901,9 +905,13 @@ val in_selector_simp_config =
 
 fun in_selector_simp ctxt = Config.get ctxt in_selector_simp_config;
 
+(*the option concept_fact_trace, of the search for concept facts: declared here, for what this
+  layer is to trace of its own work in that search*)
+val trace = Attrib.setup_config_bool \<^binding>\<open>concept_fact_trace\<close> (K false);
+
 (*the simplifier steps that one unit of work of this package may take: a call of an entry of
   the selector Simpset, a filling of the cache, an attempt at a truncate congruence rule, a
-  comparison of two values, a value shown.  A unit that needs more gives NONE from bounded;
+  comparison of two values.  A unit that needs more gives NONE from bounded;
   each unit says what it then gives.  Nested units count on the bounds around them too; with
   one bound everywhere a nested unit never gives NONE: the outermost unit stops*)
 val step_bound = 1000;
@@ -927,6 +935,21 @@ fun rewrites_all_args cong =
   let val (lhs, rhs) = Logic.dest_equals (Thm.concl_of cong)
   in not (ListPair.exists (op aconv) (#2 (strip_comb lhs), #2 (strip_comb rhs))) end;
 
+(*a simpset with its heads: the constants at the head of a left side of its rewrite rules,
+  simprocs and congruence rules, each with its types there; none when some left side has no
+  constant at its head*)
+fun with_heads ss =
+  let
+    fun heads () =
+      let
+        val {simps, simprocs, congprocs, congs, ...} = Simplifier.dest_ss ss;
+        fun lhs (_, th) = #1 (Logic.dest_equals (Thm.concl_of th));
+        val lhss =
+          map lhs simps @ maps #2 simprocs @ maps (#lhss o #2) congprocs @ map lhs congs;
+        val consts = map (try dest_Const o Term.head_of) lhss;
+      in if forall is_some consts then SOME (Symtab.make_list (map the consts)) else NONE end;
+  in (ss, Lazy.lazy heads) end;
+
 (*the simpset for rewriting inside the package: the simpset of the theory loading this file
   without its rewrite rules, simprocs and loopers, with those of its congruence rules again
   under which every argument is rewritten; the selector simprocs are added to it.  Under these
@@ -934,7 +957,7 @@ fun rewrites_all_args cong =
   assumes becomes rewrite rules there, as in simp*)
 structure Selector_Simpset = Generic_Data
 (
-  type T = simpset;
+  type T = simpset * typ list Symtab.table option lazy;
   val empty =
     let
       val ctxt = Context.the_local_context ();
@@ -942,15 +965,17 @@ structure Selector_Simpset = Generic_Data
         filter rewrites_all_args (map #2 (Simplifier.dest_congs (Simplifier.simpset_of ctxt)));
     in
       Simplifier.clear_simpset ctxt |> fold Simplifier.add_eqcong congs |> Simplifier.simpset_of
+      |> with_heads
     end;
-  val merge = Simplifier.merge_ss;
+  fun merge (data as (ss1, _), (ss2, _)) =
+    if pointer_eq (ss1, ss2) then data else with_heads (Simplifier.merge_ss (ss1, ss2));
 );
 
 (*the context having the selector Simpset as simpset, with the premises that a surrounding
   simplification has assumed (put_simpset alone drops them)*)
 fun put_selector_simpset ctxt =
   ctxt
-  |> Simplifier.put_simpset (Selector_Simpset.get (Context.Proof ctxt))
+  |> Simplifier.put_simpset (#1 (Selector_Simpset.get (Context.Proof ctxt)))
   |> Simplifier.add_prems (Simplifier.prems_of ctxt)
   |> Config.put in_selector_simp_config true;
 
@@ -958,7 +983,20 @@ in
 
 (*change the selector Simpset: f gets a context having it as simpset*)
 fun map_selector_simpset f context =
-  Selector_Simpset.map (Simplifier.simpset_map (Context.proof_of context) f) context;
+  Selector_Simpset.map
+    (with_heads o Simplifier.simpset_map (Context.proof_of context) f o #1) context;
+
+(*false only where selector_rewrite and selector_conv leave t as it is, modulo beta and eta:
+  every left side of the selector Simpset has a constant at its head, and no constant of t is
+  among its heads at an instance of one of its types there*)
+fun may_rewrite ctxt t =
+  (case Lazy.force (#2 (Selector_Simpset.get (Context.Proof ctxt))) of
+    SOME heads =>
+      let val thy = Proof_Context.theory_of ctxt in
+        t |> Term.exists_Const (fn (c, T) =>
+          exists (fn U => Sign.typ_instance thy (T, U)) (Symtab.lookup_list heads c))
+      end
+  | NONE => true);
 
 (*ct rewritten by the selector Simpset; none where the steps do not suffice*)
 fun selector_rewrite ctxt ct =
@@ -1193,11 +1231,15 @@ fun value_equation ctxt ct =
 
 (* structures compared by their leaves *)
 
+(*both terms converted*)
+fun convert_both conv ctxt = apply2 (conv o Thm.cterm_of ctxt);
+
+(*l: t == w and r: u == w joined to t == u*)
+fun join_converted (l, r) =
+  if Thm.rhs_of l aconvc Thm.rhs_of r then SOME (Thm.transitive l (Thm.symmetric r)) else NONE;
+
 (*lhs == rhs: both sides converted to the same term; the variables stay as they are*)
-fun prove_by_conv conv ctxt lhs rhs =
-  let val l = conv (Thm.cterm_of ctxt lhs) and r = conv (Thm.cterm_of ctxt rhs) in
-    if Thm.rhs_of l aconvc Thm.rhs_of r then SOME (Thm.transitive l (Thm.symmetric r)) else NONE
-  end;
+fun prove_by_conv conv ctxt lhs rhs = join_converted (convert_both conv ctxt (lhs, rhs));
 
 (*th continued: where its right side is an accessor constant applied to a structure that ok
   holds of, that is read, for as long as it can be*)
@@ -1440,15 +1482,18 @@ fun value_conv ctxt =
   Drule.beta_eta_conversion;
 
 (*two values t and u of a field compared: the same, as they stand or so rewritten, with
-  t == u; different; or not told apart, where the steps do not suffice*)
-datatype comparison = Agree of thm | Differ | Undecided;
+  t == u; different, with what t and u are rewritten to; or not told apart, where the steps do
+  not suffice*)
+datatype comparison = Agree of thm | Differ of term * term | Undecided;
 
 fun compare_values ctxt t u =
   if t aconv u then Agree (Thm.reflexive (Thm.cterm_of ctxt t))
   else
-    (case bounded (fn ctxt' => prove_by_conv (value_conv ctxt') ctxt' t u) ctxt of
-      SOME (SOME th) => Agree th
-    | SOME NONE => Differ
+    (case bounded (fn ctxt' => convert_both (value_conv ctxt') ctxt' (t, u)) ctxt of
+      SOME sides =>
+        (case join_converted sides of
+          SOME th => Agree th
+        | NONE => Differ (apply2 (Thm.term_of o Thm.rhs_of) sides))
     | NONE => Undecided);
 
 (*a selector on a structure and further arguments, where the value on the structure begins with
@@ -3887,18 +3932,15 @@ fun define_instance ctxt
     val comparisons =
       given |> map (fn (j, v) => (j, (v, compare_values ctxt (the (stored_term j)) (#value v))));
     val print = Syntax.string_of_term ctxt;
-    (*a value that no clause wrote as it is compared, unless the steps do not suffice*)
-    fun compared v =
-      print (the_default v
-        (bounded (fn ctxt' =>
-          Thm.term_of (Thm.rhs_of (value_conv ctxt' (Thm.cterm_of ctxt' v)))) ctxt));
     fun as_written ({value, ...}: given_value) = print value;
-    fun as_compared (v as {value, sub, ...}: given_value) =
-      if null sub then as_written v else compared value;
+    (*the value of a clause that differs: as written; as compared, u, where no clause wrote it*)
+    fun as_compared (v as {sub, ...}: given_value, u) = if null sub then as_written v else print u;
     fun here ({path, ...}: given_value) = Position.here (#2 (List.last path));
-    (*the path to the leaf through the clause, with the value*)
-    fun line show (v as {path, sub, ...}: given_value) =
-      "  " ^ implode_path (map #1 path @ sub) ^ here v ^ " = " ^ show v;
+    (*the path to the leaf through the clause, with the value as it is shown*)
+    fun line (v as {path, sub, ...}: given_value) shown =
+      "  " ^ implode_path (map #1 path @ sub) ^ here v ^ " = " ^ shown;
+    fun line_written v = line v (as_written v);
+    fun line_compared (v, u) = line v (as_compared (v, u));
     (*where the value of a clause comes from, unless the clause is written at the path of the
       leaf itself: the clause, and the mappings of headers on the way to the leaf*)
     fun comes_from j ({path, sub, ...}: given_value) =
@@ -3914,25 +3956,26 @@ fun define_instance ctxt
       let
         val field = quote (implode_path (leaf_path thy p_D j)) ^ " of " ^ quote xname;
         val results = map #2 (filter (fn (j', _) => j' = j) comparisons);
-        val differing = map_filter (fn (v, Differ) => SOME v | _ => NONE) results;
+        (*the values that differ, each with what the stored value and it are rewritten to*)
+        val differing = map_filter (fn (v, Differ sides) => SOME (v, sides) | _ => NONE) results;
         val undecided = map_filter (fn (v, Undecided) => SOME v | _ => NONE) results;
       in
         (case (stored j, differing, undecided) of
-          (SOME (Inherited u), v :: _, _) =>
-            ("The field " ^ field ^ " has been defined as " ^ quote (compared u) ^
-              ", but here you specified a different value " ^ quote (as_compared v)) ::
+          (SOME (Inherited _), (v, (t, u)) :: _, _) =>
+            ("The field " ^ field ^ " has been defined as " ^ quote (print t) ^
+              ", but here you specified a different value " ^ quote (as_compared (v, u))) ::
             comes_from j v
-        | (SOME (Written v), _ :: _, _) =>
+        | (SOME (Written v), (_, (t, _)) :: _, _) =>
             ["The same field " ^ field ^ " is given different values"] @
-            map (line as_compared) (v :: differing) @
+            map line_compared ((v, t) :: map (apsnd #2) differing) @
             ["The specifications must be identical in term"]
         | (SOME s, [], _ :: _) =>
             ("Cannot tell whether the " ^ (if length undecided = 1 then "two " else "") ^
               "values of the field " ^ field ^ " are the same") ::
             (case s of
               Inherited u => "  " ^ implode_path (leaf_path thy p_D j) ^ " = " ^ print u
-            | Written v => line as_written v) ::
-            map (line as_written) undecided
+            | Written v => line_written v) ::
+            map line_written undecided
         | _ => [])
       end;
     (*one complaint for each leaf, the leaves in their order*)
