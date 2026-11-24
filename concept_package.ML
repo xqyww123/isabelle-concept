@@ -555,7 +555,7 @@ fun qualifiers thy name =
 (*the structure, and that the concept holds of it, with the name of this fact*)
 fun elements thy name =
   let val S = Free ("\<S>", #scheme (Concept_Type.the_info thy name)) in
-    {S = S, axioms = Binding.name (Long_Name.base_name name ^ "_axioms"),
+    {S = S, axiom = Binding.name (Long_Name.base_name name ^ "_axiom"),
      assumption = HOLogic.mk_Trueprop (holds name S)}
   end;
 
@@ -778,25 +778,25 @@ fun target name : Named_Target.other_target =
     val cname = Long_Name.base_name name;
     fun fixes S = let val (s, T) = dest_Free S in [(Binding.name s, SOME T, NoSyn)] end;
     fun setup thy =
-      let val {S, axioms, assumption} = elements thy name in
+      let val {S, axiom, assumption} = elements thy name in
         Proof_Context.init_global thy
         |> Variable.declare_term S
         |> Proof_Context.add_fixes (fixes S) |> #2
         |> Proof_Context.add_assms Assumption.assume_export
-            [((axioms, [Classical.safe_intro NONE]), [(assumption, [])])] |> #2
+            [((axiom, [Classical.safe_intro NONE]), [(assumption, [])])] |> #2
         |> Proof_Context.put_default_fact_qualifiers (qualifiers thy name)
         |> Config.put Local_Theory.global_form_enabled true
       end;
     fun pretty lthy =
       let
         val thy = Proof_Context.theory_of lthy;
-        val {S, axioms, assumption} = elements thy name;
+        val {S, axiom, assumption} = elements thy name;
         val ctxt = Proof_Context.init_global thy;
       in
         [Pretty.block (Pretty.keyword1 "concept" :: Pretty.brk 1 :: Pretty.str cname ::
           maps (fn elem => [Pretty.fbrk, Pretty.chunks (Element.pretty_ctxt ctxt elem)])
            [Element.Fixes (fixes S),
-            Element.Assumes [((axioms, []), [(assumption, [])])]])]
+            Element.Assumes [((axiom, []), [(assumption, [])])]])]
       end;
     fun not_possible command hint _ =
       error (command ^ " cannot be used in concept " ^ cname ^ hint);

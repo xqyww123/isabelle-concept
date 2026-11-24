@@ -10,7 +10,8 @@ definitions) cannot be reached by any input.  Proofs inside rewrite with fixed r
 only.  A selector simproc synthesizes the equations of the selectors on instances, views and
 truncate.  The selector Simpset rewrites with these simprocs and with no rule of the theory's
 simpset; as in simp, what its congruence rules assume (P in P --> Q, x : A under a bounded
-quantifier) rewrites the other side.  It is used through put_selector_simpset only.
+quantifier) rewrites the other side.  It is used through selector_rewrite, selector_conv,
+selector_simp_tac and selector_simplify only, each call within a bound on the simplifier steps.
 *)
 
 signature CONCEPT_TYPE =
@@ -24,8 +25,8 @@ sig
   type source =
    {kind: source_kind, layer: string, term: term, fields: thm, forward: thm option}
   type instance =
-   {name: string, const: term, concept: parent, params: term list, constraint: term,
-    concept_eq: thm, family: string option, source: source option}
+   {name: string, const: term, concept: parent, params: term list, premises: term list,
+    constraint: term, concept_eq: thm, family: string option, source: source option}
   val base_name: theory -> string
   val get_info: theory -> string -> info option
   val the_info: theory -> string -> info
@@ -45,7 +46,11 @@ sig
   val add_truncate_cong: string * int -> cong_rule -> Context.generic -> Context.generic
   val derive_truncate_cong: Proof.context -> {const: term, def: thm, position: int} ->
     cong_rule option
-  val put_selector_simpset: Proof.context -> Proof.context
+  val in_selector_simp: Proof.context -> bool
+  val selector_rewrite: Proof.context -> cterm -> thm option
+  val selector_conv: Proof.context -> conv
+  val selector_simp_tac: Proof.context -> thm list -> int -> tactic
+  val selector_simplify: Proof.context -> thm -> thm option
   val map_selector_simpset: (Proof.context -> Proof.context) -> Context.generic -> Context.generic
   val selector_equation: Proof.context -> term -> thm option
   val source_equation: Proof.context -> term -> thm option
@@ -63,7 +68,7 @@ sig
     {context: Proof.context, S: term, substitution: (string * term) list}
   val define_instance: Proof.context ->
     {family: string option, name: binding, define: bool, concept: parent, params: term list,
-     where_: ((string * Position.T) list * string) list, constraint: term} ->
+     where_: ((string * Position.T) list * string) list, premises: term list} ->
     theory -> instance * theory
 end;
 
@@ -115,15 +120,16 @@ datatype source_kind = Family | Super;
 type source =
  {kind: source_kind, layer: string, term: term, fields: thm, forward: thm option};
 
-(*an instance constant applied to its parameters: the value of each leaf, more, and the base's
-  leaf (True, or the conjunction of the if clauses); wholes: the views given as a whole, each by
-  the view constants from the instance outward, with the value; concept_eq: concept (x params) =
-  constraint; implications: concept (x ?params) ==> concept ?param, by the parameter's position;
+(*an instance constant applied to its parameters: the value of each leaf, more, and the
+  premises of the instance, whose conjunction is the base's leaf; wholes: the views given as a
+  whole, each by the view constants from the instance outward, with the value; concept_eq:
+  concept (x params) = that conjunction; implications: concept (x ?params) ==> concept ?param,
+  by the parameter's position;
   agreed: x ?params == x ?params ==> u == v for a value u stored for a leaf and another value v
   given to it that was compared as the same, the premise being there for the instantiation*)
 type instance_entry =
  {name: string, const: term, concept: parent, params: term list, values: term list,
-  more: term, wholes: (string list * term) list, constraint: term, def: thm, concept_eq: thm,
+  more: term, wholes: (string list * term) list, premises: term list, def: thm, concept_eq: thm,
   family: string option, source: source option, implications: thm Inttab.table,
   agreed: thm list};
 
@@ -151,10 +157,10 @@ fun map_entry_thms f ({name, args, parent, owner, layer, scheme, more, views}: e
    views = map (map_view_thms f) views};
 
 fun map_instance_thms f
-    ({name, const, concept, params, values, more, wholes, constraint, def, concept_eq, family,
+    ({name, const, concept, params, values, more, wholes, premises, def, concept_eq, family,
       source, implications, agreed}: instance_entry) : instance_entry =
   {name = name, const = const, concept = concept, params = params, values = values, more = more,
-   wholes = wholes, constraint = constraint, def = f def, concept_eq = f concept_eq,
+   wholes = wholes, premises = premises, def = f def, concept_eq = f concept_eq,
    family = family,
    source =
     Option.map (fn {kind, layer, term, fields, forward} =>
@@ -331,8 +337,13 @@ type info =
   scheme: typ, more: term, views: view list};
 
 type instance =
- {name: string, const: term, concept: parent, params: term list, constraint: term,
-  concept_eq: thm, family: string option, source: source option};
+ {name: string, const: term, concept: parent, params: term list, premises: term list,
+  constraint: term, concept_eq: thm, family: string option, source: source option};
+
+(*the base's leaf of an instance with these premises: True for none, the one, or their
+  conjunction, nested to the right*)
+fun mk_constraint [] = \<^Const>\<open>True\<close>
+  | mk_constraint premises = foldr1 HOLogic.mk_conj premises;
 
 fun info_of ({name, args, parent, owner, scheme, more, views, ...}: entry) : info =
   {name = name, args = args, parent = parent, owner = owner, scheme = scheme, more = more,
@@ -340,10 +351,11 @@ fun info_of ({name, args, parent, owner, scheme, more, views, ...}: entry) : inf
      {name = name, qualifier = qualifier, parent = parent, concept_eq = concept_eq}) views};
 
 fun instance_of
-    ({name, const, concept, params, constraint, concept_eq, family, source, ...}: instance_entry)
+    ({name, const, concept, params, premises, concept_eq, family, source, ...}: instance_entry)
     : instance =
-  {name = name, const = const, concept = concept, params = params, constraint = constraint,
-   concept_eq = concept_eq, family = family, source = source};
+  {name = name, const = const, concept = concept, params = params, premises = premises,
+   constraint = mk_constraint premises, concept_eq = concept_eq, family = family,
+   source = source};
 
 fun get_info thy = Option.map info_of o get_entry thy;
 val the_info = info_of oo the_entry;
@@ -680,6 +692,22 @@ fun resolve _ p more slots views _ [] = Node (p, more, slots, rev views)
           then Slot (List.last slots) else raise NO_FIELD (walked, p, seg, pos)
       | (NONE, _) => raise NO_FIELD (walked, p, seg, pos));
 
+(*the leaf of the node of p that a path names, with the mappings of headers that the path
+  passes, the innermost first: the concept declaring the view, the path below its node that the
+  where clause of the view gives another name, and that name*)
+fun mapped_leaf _ p [] = raise Fail ("mapped_leaf: no leaf of " ^ #2 p)
+  | mapped_leaf thy p (seg :: segs) =
+      (case (AList.lookup (op =) (children thy p) seg, seg) of
+        (SOME (Field_Child i, _), _) => (i, [])
+      | (SOME (View_Child {parent = p', slots, ...}, (_, d)), _) =>
+          let
+            val (r, mappings) = mapped_leaf thy p' segs;
+            val i = (case nth slots r of Leaf i => i | Given _ => raise Fail "mapped_leaf");
+            val below = seg :: leaf_path thy p' r and name = leaf_path thy p i;
+          in (i, if below = name then mappings else mappings @ [(d, below, name)]) end
+      | (NONE, "super") => mapped_leaf thy (the (super_of thy p)) segs
+      | (NONE, _) => (length (flat_leaves thy p), []));
+
 (*the second line of the messages about a missing field of the node of p*)
 fun fields_line thy p =
   let
@@ -847,8 +875,46 @@ fun given_values _ (Given_Leaf j) t = [(j, t)]
   | given_values thy (Given_Node (p', _, jks, _)) t =
       map (fn (j, k) => (j, read_leaf thy p' k t)) jks;
 
+(*a value that a where clause of an instance gives a leaf.  clause: the number of the clause in
+  the order written; path: the path of the clause; sub: the leaf's path below it, empty unless
+  the clause gives a node, from which the value is read; directly: see gives_directly*)
+type given_value =
+ {value: term, clause: int, path: (string * Position.T) list, sub: string list, directly: bool};
+
+(*the value stored for a leaf of an instance: that of the member of the family that the
+  instance continues, or one that a clause gives*)
+datatype stored_leaf = Inherited of term | Written of given_value;
+
 
 (** the selector Simpset **)
+
+(*whether a context is one that an entry of the selector Simpset has made, or comes from one:
+  for those whose procedures the selector Simpset calls*)
+val in_selector_simp_config =
+  Config.declare_bool ("concept_in_selector_simp", \<^here>) (K false);
+
+fun in_selector_simp ctxt = Config.get ctxt in_selector_simp_config;
+
+(*the simplifier steps that one unit of work of this package may take: a call of an entry of
+  the selector Simpset, a filling of the cache, an attempt at a truncate congruence rule, a
+  comparison of two values, a value shown.  A unit that needs more gives NONE from bounded;
+  each unit says what it then gives.  Nested units count on the bounds around them too; with
+  one bound everywhere a nested unit never gives NONE: the outermost unit stops*)
+val step_bound = 1000;
+
+fun bounded f = Simp_Steps.limited step_bound f;
+
+(*the context for rewriting with the fixed rules of this package and with given definitions
+  alone: no bound counts these steps.  Such rewriting always ends, in a number of steps that
+  grows with the structure, and runs neither the selector Simpset nor any rule or assumption
+  of a user; so a unit that never ends still takes ever more counted steps*)
+fun uncounted ctxt =
+  Simp_Steps.inherit (Proof_Context.init_global (Proof_Context.theory_of ctxt)) ctxt;
+
+(*only here is the selector Simpset put on a context: map_selector_simpset does it to change it,
+  the four entries to run it, each within a bound.  A procedure that the selector Simpset calls
+  gets a context with the counters of the entry*)
+local
 
 (*a congruence rule f xs == f ys under which every argument is rewritten; one with the same term
   at an argument of both sides (the branches of if and case) leaves that argument as it is*)
@@ -875,16 +941,51 @@ structure Selector_Simpset = Generic_Data
   val merge = Simplifier.merge_ss;
 );
 
+(*the context having the selector Simpset as simpset, with the premises that a surrounding
+  simplification has assumed (put_simpset alone drops them)*)
+fun put_selector_simpset ctxt =
+  ctxt
+  |> Simplifier.put_simpset (Selector_Simpset.get (Context.Proof ctxt))
+  |> Simplifier.add_prems (Simplifier.prems_of ctxt)
+  |> Config.put in_selector_simp_config true;
+
+in
+
 (*change the selector Simpset: f gets a context having it as simpset*)
 fun map_selector_simpset f context =
   Selector_Simpset.map (Simplifier.simpset_map (Context.proof_of context) f) context;
 
-(*the only way to use the selector Simpset: the context having it as simpset, with the premises
-  that a surrounding simplification has assumed (put_simpset alone drops them)*)
-fun put_selector_simpset ctxt =
-  ctxt
-  |> Simplifier.put_simpset (Selector_Simpset.get (Context.Proof ctxt))
-  |> Simplifier.add_prems (Simplifier.prems_of ctxt);
+(*ct rewritten by the selector Simpset; none where the steps do not suffice*)
+fun selector_rewrite ctxt ct =
+  bounded (fn ctxt' => Simplifier.rewrite (put_selector_simpset ctxt') ct) ctxt;
+
+(*the same, ct unchanged where the steps do not suffice*)
+fun selector_conv ctxt ct = the_default (Thm.reflexive ct) (selector_rewrite ctxt ct);
+
+(*subgoal i simplified by the selector Simpset with the rules, which are added for this call
+  only; its premises are assumed, as in asm_full_simp_tac.  The subgoal stays as it is where
+  the steps do not suffice*)
+fun selector_simp_tac ctxt rules i st =
+  (case
+    bounded (fn ctxt' =>
+      SINGLE (asm_full_simp_tac (fold Simplifier.add_simp rules (put_selector_simpset ctxt')) i)
+        st) ctxt of
+    SOME (SOME st') => Seq.single st'
+  | SOME NONE => Seq.empty
+  | NONE => Seq.single st);
+
+(*a theorem simplified by the selector Simpset as in asm_lr_simplify: each premise is rewritten,
+  then assumed for what follows it.  What is assumed makes no rewrite rule: it only enters the
+  premises, where it solves the conditions of the equations; the mksimps handlers still take
+  it apart.  None where the steps do not suffice*)
+fun selector_simplify ctxt th =
+  bounded (fn ctxt' =>
+    Simplifier.asm_lr_simplify
+      (put_selector_simpset ctxt'
+        |> Simplifier.set_mksimps_context (fn prem => fn ctxt'' =>
+            ([], Simplifier.add_prems [prem] ctxt''))) th) ctxt;
+
+end;
 
 
 (** the selector simproc **)
@@ -1034,7 +1135,7 @@ fun unfold_conv ctxt defs ct =
       let
         val ct' = Thm.rhs_of th;
         val rules = defs @ unfold_rules thy [Thm.term_of ct'];
-        val th' = Raw_Simplifier.rewrite_wrt ctxt false rules ct';
+        val th' = Raw_Simplifier.rewrite_wrt (uncounted ctxt) false rules ct';
       in if Thm.is_reflexive th' then th else unfold (Thm.transitive th th') end;
     val th = unfold (Thm.reflexive ct);
   in Thm.transitive th (Thm.eta_conversion (Thm.rhs_of th)) end;
@@ -1062,11 +1163,12 @@ fun prove_unfold thy defs xs lhs rhs =
 (** the cache of the equations **)
 
 (*The equations that the simprocs prove, by their left sides: constants of this package applied
-  to schematic variables.  An equation is kept until a garbage collection finds it unused; the
-  count is of the equations stored since the dead entries were last removed.*)
+  to schematic variables, each with the simplifier steps that its proof took.  An equation is
+  kept until a garbage collection finds it unused; the count is of the equations stored since
+  the dead entries were last removed.*)
 val cache =
   Synchronized.var "Concept_Type.cache"
-    (0, Termtab.empty: thm Unsynchronized.weak_ref Termtab.table);
+    (0, Termtab.empty: (int * thm Unsynchronized.weak_ref) Termtab.table);
 
 (*the finished ancestor theory that has every constant and type constructor of t, in which t
   certifies and its constants have well-sorted types, if any: what is proved there serves all
@@ -1098,31 +1200,41 @@ fun home thy t =
 
 (*the meta equation whose left side is key: the one stored, when the theory has the theory of
   that; else proved, in the home of key or in the theory, apart from what the context assumes,
-  and stored unless the one stored serves the theories that the new one serves*)
+  and stored unless the one stored serves the theories that the new one serves.  None where
+  nothing proves it or the steps do not suffice.  The proof is one bounded unit, and the stored
+  equation charges the steps of its proof in such a unit: the bounds around count the same
+  whether the equation was stored or not*)
 fun cached ctxt key prove =
   let
     val thy = Proof_Context.theory_of ctxt;
-    val peek = Option.mapPartial Unsynchronized.weak_peek oo Termtab.lookup;
+    fun peek tab =
+      Termtab.lookup tab key |> Option.mapPartial (fn (steps, r) =>
+        Option.map (pair steps) (Unsynchronized.weak_peek r));
     fun serves th th' = Context.subthy_id (Thm.theory_id th, Thm.theory_id th');
-    fun store th (n, tab) =
+    fun store (steps, th) (n, tab) =
       let
         val tab' =
-          if (case peek tab key of SOME th' => serves th' th | NONE => false) then tab
-          else Termtab.update (key, Unsynchronized.weak_ref th) tab;
-        fun live (entry as (_, r)) = Unsynchronized.weak_active r ? Termtab.update entry;
+          if (case peek tab of SOME (_, th') => serves th' th | NONE => false) then tab
+          else Termtab.update (key, (steps, Unsynchronized.weak_ref th)) tab;
+        fun live (entry as (_, (_, r))) = Unsynchronized.weak_active r ? Termtab.update entry;
       in if n < 255 then (n + 1, tab') else (0, Termtab.fold live tab' Termtab.empty) end;
     fun proved () =
-      let
-        val ctxts = map Proof_Context.init_global (the_list (home thy key) @ [thy]);
-      in
-        get_first prove ctxts |> Option.map (fn th =>
-          (Synchronized.change cache (store (Thm.trim_context th)); Thm.transfer thy th))
-      end;
+      bounded (fn ctxt' =>
+        let
+          val ctxts =
+            map (Simp_Steps.inherit ctxt' o Proof_Context.init_global)
+              (the_list (home thy key) @ [thy]);
+        in get_first prove ctxts |> Option.map (fn th => (the (Simp_Steps.count ctxt'), th)) end)
+        ctxt
+      |> Option.join
+      |> Option.map (fn (steps, th) =>
+        (Synchronized.change cache (store (steps, Thm.trim_context th)); Thm.transfer thy th));
   in
-    (case peek (#2 (Synchronized.value cache)) key of
-      SOME th =>
+    (case peek (#2 (Synchronized.value cache)) of
+      SOME (steps, th) =>
         if Context.subthy_id (Thm.theory_id th, Context.theory_id thy)
-        then SOME (Thm.transfer thy th) else proved ()
+        then bounded (fn ctxt' => (Simp_Steps.charge steps ctxt'; Thm.transfer thy th)) ctxt
+        else proved ()
     | NONE => proved ())
   end;
 
@@ -1227,14 +1339,21 @@ fun select ctxt value ct =
   nothing assumed, then once more with the values that begin with a pattern, so that values
   the selector Simpset makes equal stay equal; beta-eta normal*)
 fun value_conv ctxt =
-  Simplifier.rewrite (put_selector_simpset ctxt) then_conv
-  Simplifier.rewrite (put_selector_simpset (Config.put pattern_values true ctxt)) then_conv
+  selector_conv ctxt then_conv
+  selector_conv (Config.put pattern_values true ctxt) then_conv
   Drule.beta_eta_conversion;
 
-(*t == u for two values of a field that are the same: as they stand, or so rewritten*)
-fun same_value ctxt t u =
-  if t aconv u then SOME (Thm.reflexive (Thm.cterm_of ctxt t))
-  else prove_by_conv (value_conv ctxt) ctxt t u;
+(*two values t and u of a field compared: the same, as they stand or so rewritten, with
+  t == u; different; or not told apart, where the steps do not suffice*)
+datatype comparison = Agree of thm | Differ | Undecided;
+
+fun compare_values ctxt t u =
+  if t aconv u then Agree (Thm.reflexive (Thm.cterm_of ctxt t))
+  else
+    (case bounded (fn ctxt' => prove_by_conv (value_conv ctxt') ctxt' t u) ctxt of
+      SOME (SOME th) => Agree th
+    | SOME NONE => Differ
+    | NONE => Undecided);
 
 (*a selector on a structure and further arguments, where the value on the structure begins with
   a pattern: that value at the arguments, when they are explicit as far as the pattern goes*)
@@ -1619,14 +1738,15 @@ fun rule_at context (c, i) n =
 (*a term rewritten: the definition def unfolded, then the selector Simpset, then for a constant
   of this package the fixed rules down to the leaves*)
 fun cong_conv ctxt own def =
-  Raw_Simplifier.rewrite_wrt ctxt false [def] then_conv
-  Simplifier.rewrite (put_selector_simpset ctxt) then_conv
+  Raw_Simplifier.rewrite_wrt (uncounted ctxt) false [def] then_conv
+  selector_conv ctxt then_conv
   (if own then unfold_conv ctxt [] else Thm.eta_conversion);
 
 fun prove_cong_meta ctxt own def = prove_by_conv (cong_conv ctxt own def) ctxt;
 
+(*one attempt, a bounded unit: none where the two sides differ or the steps do not suffice*)
 fun prove_cong ctxt own def lhs rhs =
-  prove_cong_meta ctxt own def lhs rhs
+  Option.join (bounded (fn ctxt' => prove_cong_meta ctxt' own def lhs rhs) ctxt)
   |> Option.map (fn th => th RS @{thm meta_eq_to_obj_eq});
 
 (*a constant of this package: its definition is unfolded down to the leaves*)
@@ -1643,7 +1763,8 @@ fun arg_names names n =
 
 (*the rule of a constant at the argument position i, from its definition; names: those of its
   arguments.  None when the more slot of the argument is no type variable, when that type
-  variable is in the type of another argument, or when the two sides differ*)
+  variable is in the type of another argument, or when the two sides differ or the steps do
+  not suffice*)
 fun derive_cong ctxt names {const = f, def, position = i} =
   let
     val thy = Proof_Context.theory_of ctxt;
@@ -3406,7 +3527,7 @@ fun super_param thy c =
 (*concept (c ?xs) ==> concept u for the instance c: u its source, or one of ?xs*)
 fun add_implication c th thy =
   let
-    val {name, const, concept, params, values, more, wholes, constraint, def, concept_eq, family,
+    val {name, const, concept, params, values, more, wholes, premises, def, concept_eq, family,
       source, implications, agreed} = the (get_instance_entry thy c);
     val structure_of = #2 o dest_comb o HOLogic.dest_Trueprop;
     val (prem, concl) = Logic.dest_implies (Thm.prop_of th);
@@ -3421,7 +3542,7 @@ fun add_implication c th thy =
   in
     thy |> put_instance
      {name = name, const = const, concept = concept, params = params, values = values,
-      more = more, wholes = wholes, constraint = constraint, def = def, concept_eq = concept_eq,
+      more = more, wholes = wholes, premises = premises, def = def, concept_eq = concept_eq,
       family = family, source = source',
       implications = if i < 0 then implications else Inttab.update (i, th) implications,
       agreed = agreed}
@@ -3439,7 +3560,7 @@ fun add_implication c th thy =
   and no super is given, no constant is made: the given values are checked against that member,
   which is returned*)
 fun define_instance ctxt
-    {family, name = b, define, concept = p_D, params, where_, constraint} thy =
+    {family, name = b, define, concept = p_D, params, where_, premises} thy =
   let
     val xname = Binding.long_name_of b;
     val dname = Long_Name.base_name (#2 p_D);
@@ -3533,78 +3654,121 @@ fun define_instance ctxt
     val read =
       entries |> map (fn entry =>
         checked entry (read_given thy ctxt (p_D, HOLogic.unitT) xname entry));
-    (*the values that the clauses give the leaves, in the order written, those of more last:
-      with the clause, and whether it gives the leaf directly*)
-    val given =
-      read @ mores |> maps (fn (entry as (_, _, g), t) =>
-        map (fn (j, v) => (j, (v, entry, gives_directly thy p_D entry j))) (given_values thy g t));
+    (*the values that the clauses give the leaves, in the order written, those of more last*)
+    val given: (int * given_value) list =
+      flat (map_index (fn (i, (entry as (path, _, g), t)) =>
+        map2 (fn (j, v) => fn (_, sub) =>
+          (j,
+           {value = v, clause = i, path = path, sub = sub,
+            directly = gives_directly thy p_D entry j}))
+          (given_values thy g t) (given_leaves thy g)) (read @ mores));
 
-    (* the source, with the values of its leaves *)
-    (*a value read from a node as the messages show it: as it is compared*)
-    fun compared v =
-      Syntax.string_of_term ctxt (Thm.term_of (Thm.rhs_of (value_conv ctxt (Thm.cterm_of ctxt v))));
+    (* the source *)
     (*of the clauses that name a part by super alone, the one with the shortest path, which
-      covers the most layers, the first written among equal ones*)
+      covers the most layers, the first written among equal ones: its number, as a source*)
     val super =
-      read |> map_filter (fn ((path, _, g as Given_Node (p', _, _, _)), t) =>
+      map_index I read |> map_filter (fn (i, ((path, _, Given_Node (p', _, _, _)), t)) =>
           if forall (fn (seg, _) => seg = "super") path
-          then
-            SOME (length path,
-              ((Super, #owner (the_entry thy (#2 p')), t),
-                map (fn (j, v) => (j, (v, fn () => compared v))) (given_values thy g t)))
+          then SOME (length path, (i, (Super, #owner (the_entry thy (#2 p')), t)))
           else NONE
         | _ => NONE)
       |> sort (int_ord o apply2 #1) |> try hd |> Option.map #2;
     val provided =
       if define then (case super of NONE => continued () | SOME _ => NONE) else result;
-    (*the source with the values of its leaves, each with how it is shown: as that member stores
-      it, for a member of the family*)
     val sourced =
       (case (super, provided) of
-        (NONE, SOME {source, values, ...}) =>
-          SOME (source,
-            values |> map (fn (j, u) => (j, (u, fn () => Syntax.string_of_term ctxt u))))
-      | _ => super);
-    val source_values = (case sourced of SOME (_, values) => values | NONE => []);
+        (SOME (_, source), _) => SOME source
+      | (NONE, SOME {source, ...}) => SOME source
+      | (NONE, NONE) => NONE);
+    (*the values that the instance takes over from the member of the family it continues*)
+    val inherited =
+      (case (super, provided) of (NONE, SOME {values, ...}) => values | _ => []);
     (*the more of a view needs no value where its type is unit*)
     val units =
       map_index I leaves_D |> map_filter (fn (j, {name, typ, ...}) =>
         if is_none name andalso typ = HOLogic.unitT andalso
           List.last (leaf_path thy p_D j) = "more"
         then SOME (j, HOLogic.unit) else NONE);
-    (*a value that a clause gives as the messages show it*)
-    fun shown (v, (_, _, Given_Leaf _), _) = Syntax.string_of_term ctxt v
-      | shown (v, (_, _, Given_Node _), _) = compared v;
-    (*the value stored for a leaf that the source or a clause gives, with how it is shown: that
-      of the source, so that the equation of the source holds by the definition; else the first
+    fun given_to j = map #2 (filter (fn (j', _) => j' = j) given);
+    (*the value stored for a leaf: the one taken over, so that the equation of the source holds
+      by the definition; else that of the source clause, for the same reason; else the first
       given directly; else the first that comes through a mapping*)
     fun stored j =
-      (case AList.lookup (op =) source_values j of
-        SOME s => SOME s
-      | NONE =>
-          (case map #2 (filter (fn (j', _) => j' = j) given) of
-            [] => NONE
-          | vs =>
-              let val v = the_default (hd vs) (find_first #3 vs)
-              in SOME (#1 v, fn () => shown v) end));
+      (case (AList.lookup (op =) inherited j, given_to j) of
+        (SOME u, _) => SOME (Inherited u)
+      | (NONE, []) => NONE
+      | (NONE, vs) =>
+          let
+            fun of_source ({clause, ...}: given_value) = SOME clause = Option.map #1 super;
+            val preferred = get_first (fn pred => find_first pred vs) [of_source, #directly];
+          in SOME (Written (the_default (hd vs) preferred)) end);
+    fun stored_term j =
+      stored j |> Option.map (fn Inherited u => u | Written {value, ...} => value);
     fun value_of j =
-      (case stored j of SOME (u, _) => SOME u | NONE => AList.lookup (op =) units j);
-    (*every value given to a leaf is the same as the one stored: the equations of those that
-      differ as they stand.  Else one line for each leaf with another value, the first written
-      of them, the leaves in their order*)
+      (case stored_term j of SOME u => SOME u | NONE => AList.lookup (op =) units j);
+
+    (* every value given to a leaf is the same as the one stored *)
     val comparisons =
-      given |> map (fn (j, v) => (j, (v, same_value ctxt (#1 (the (stored j))) (#1 v))));
+      given |> map (fn (j, v) => (j, (v, compare_values ctxt (the (stored_term j)) (#value v))));
+    val print = Syntax.string_of_term ctxt;
+    (*a value that no clause wrote as it is compared, unless the steps do not suffice*)
+    fun compared v =
+      print (the_default v
+        (bounded (fn ctxt' =>
+          Thm.term_of (Thm.rhs_of (value_conv ctxt' (Thm.cterm_of ctxt' v)))) ctxt));
+    fun as_written ({value, ...}: given_value) = print value;
+    fun as_compared (v as {value, sub, ...}: given_value) =
+      if null sub then as_written v else compared value;
+    fun here ({path, ...}: given_value) = Position.here (#2 (List.last path));
+    (*the path to the leaf through the clause, with the value*)
+    fun line show (v as {path, sub, ...}: given_value) =
+      "  " ^ implode_path (map #1 path @ sub) ^ here v ^ " = " ^ show v;
+    (*where the value of a clause comes from, unless the clause is written at the path of the
+      leaf itself: the clause, and the mappings of headers on the way to the leaf*)
+    fun comes_from j ({path, sub, ...}: given_value) =
+      if map #1 path = leaf_path thy p_D j then []
+      else
+        ["The value comes from " ^ field_of path ^
+          implode (#2 (mapped_leaf thy p_D (map #1 path @ sub)) |> map (fn (d, below, name) =>
+            ". The concept " ^ quote (Long_Name.base_name d) ^ " itself specifies " ^
+              quote (implode_path below) ^ " as " ^ quote (implode_path name)))];
+    (*what is wrong with the values of a leaf: some differ from the one stored; else some
+      cannot be told apart from it*)
+    fun complaint j =
+      let
+        val field = quote (implode_path (leaf_path thy p_D j)) ^ " of " ^ quote xname;
+        val results = map #2 (filter (fn (j', _) => j' = j) comparisons);
+        val differing = map_filter (fn (v, Differ) => SOME v | _ => NONE) results;
+        val undecided = map_filter (fn (v, Undecided) => SOME v | _ => NONE) results;
+      in
+        (case (stored j, differing, undecided) of
+          (SOME (Inherited u), v :: _, _) =>
+            ("The field " ^ field ^ " has been defined as " ^ quote (compared u) ^
+              ", but here you specified a different value " ^ quote (as_compared v)) ::
+            comes_from j v
+        | (SOME (Written v), _ :: _, _) =>
+            ["The same field " ^ field ^ " is given different values"] @
+            map (line as_compared) (v :: differing) @
+            ["The specifications must be identical in term"]
+        | (SOME s, [], _ :: _) =>
+            ("Cannot tell whether the " ^ (if length undecided = 1 then "two " else "") ^
+              "values of the field " ^ field ^ " are the same") ::
+            (case s of
+              Inherited u => "  " ^ implode_path (leaf_path thy p_D j) ^ " = " ^ print u
+            | Written v => line as_written v) ::
+            map (line as_written) undecided
+        | _ => [])
+      end;
+    (*one complaint for each leaf, the leaves in their order*)
     val _ =
-      (case distinct (eq_fst (op =)) (filter (is_none o #2 o #2) comparisons) of
+      (case maps complaint (0 upto length leaves_D) of
         [] => ()
-      | differing =>
-          error (cat_lines (sort (int_ord o apply2 #1) differing |> map (fn (j, (v, _)) =>
-            "The field " ^ implode_path (leaf_path thy p_D j) ^ " of " ^ xname ^
-              " has been defined as " ^ #2 (the (stored j)) () ^
-              ", but here you specified a different value `" ^ shown v ^ "`"))));
+      | complaints => error (cat_lines complaints));
+    (*the equations of the values that are the same as the ones stored, but not as they stand*)
     val agreed =
-      comparisons |> map_filter (fn (_, (_, th)) =>
-        Option.mapPartial (Option.filter (not o Thm.is_reflexive)) th);
+      comparisons |> map_filter (fn (_, (_, Agree th)) =>
+          if Thm.is_reflexive th then NONE else SOME th
+        | _ => NONE);
     val missing = filter_out (is_some o value_of o #1) (map_index I leaves_D);
     val _ = null missing orelse
       let
@@ -3627,6 +3791,7 @@ fun define_instance ctxt
     (* the constant and its sealed definition *)
     fun defined () =
       let
+        val constraint = mk_constraint premises;
         val value = mk_value thy p_D constraint values more;
         val ((c, def), thy1) = define_sealed (b, T) (fold_rev lambda params value) thy;
         val cname = dest_Const_name c;
@@ -3635,7 +3800,7 @@ fun define_instance ctxt
           prove_definitional thy1 def param_names lhs constraint value;
         val base_more = app thy1 (#more (the_entry thy1 (base_name thy1)));
         val source =
-          sourced |> Option.map (fn ((kind, layer, t), _) =>
+          sourced |> Option.map (fn (kind, layer, t) =>
             let val truncate = app thy1 (#truncate (the_layer thy1 layer)) in
               {kind = kind, layer = layer, term = t,
                fields =
@@ -3645,7 +3810,7 @@ fun define_instance ctxt
             end);
         val instance: instance_entry =
          {name = cname, const = c, concept = p_D, params = params, values = values, more = more,
-          wholes = wholes, constraint = constraint, def = def, concept_eq = concept_eq,
+          wholes = wholes, premises = premises, def = def, concept_eq = concept_eq,
           family = family, source = source, implications = Inttab.empty,
           agreed =
             agreed |> map (fn th =>
