@@ -1,7 +1,8 @@
 (*  Title:      concept_package.ML
 
 The command concept: its header, the predicate of a concept with its rules, and the named target
-of its block.
+of its block.  The facts that concept_instance proves of an instance constant are kept here, with
+those of the concepts: the type layer knows no predicate but concept.
 *)
 
 signature CONCEPT_PACKAGE =
@@ -21,6 +22,9 @@ sig
   val the_concept: theory -> string -> concept
   val entailment: theory -> string -> string -> entailment option
   val ancestors: theory -> string -> (string * entailment) list
+  type instance_facts = {destructions: (string * thm) list, of_concept: thm}
+  val add_instance_facts: string -> instance_facts -> theory -> theory
+  val instance_facts: theory -> string -> instance_facts option
   structure Declared: HOOKS where type arg = string and type state = theory
   type defined = {concept: string, binding: binding, mixfix: mixfix, lhs: term}
   structure Defined: HOOKS where type arg = defined and type state = local_theory
@@ -304,6 +308,34 @@ fun already_bound ctxt cname a th =
 
 (*run when a concept is declared, after its data are stored*)
 structure Declared = Hooks(type arg = string type state = theory);
+
+
+(** the facts of instances **)
+
+(*What concept_instance proves of an instance constant c, declared of the concept D.
+  destructions: concept (c ?xs) ==> ..., by the names of what they conclude: ambient first where
+  there is one, then the conditions of the instance in the order of its declaration;
+  of_concept: concept (c ?xs) ==> D (c ?xs)*)
+type instance_facts = {destructions: (string * thm) list, of_concept: thm};
+
+fun map_instance_facts f ({destructions, of_concept}: instance_facts) : instance_facts =
+  {destructions = map (apsnd f) destructions, of_concept = f of_concept};
+
+(*by the name of the instance constant; theorems are stored without their theory*)
+structure Instance_Facts = Theory_Data
+(
+  type T = instance_facts Symtab.table;
+  val empty = Symtab.empty;
+  val merge = Symtab.merge (K true);
+);
+
+(*once for an instance constant, when its proof is finished*)
+fun add_instance_facts c facts =
+  Instance_Facts.map (Symtab.update_new (c, map_instance_facts Thm.trim_context facts));
+
+fun instance_facts thy c =
+  Symtab.lookup (Instance_Facts.get thy) c
+  |> Option.map (map_instance_facts (Thm.transfer thy));
 
 
 (** the predicate **)
