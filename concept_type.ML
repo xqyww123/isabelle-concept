@@ -2,16 +2,21 @@
 
 The concept types.  A value of a concept type holds all parameters of a concept.  Every concept
 with leaves of its own adds a layer: a typedef over a balanced tuple of its leaves and the more
-slot.  All chains start at the base concept "concept", whose single bool leaf is read by the
-predicate concept.  A parent with a qualifier is a view: its leaves not given by "where" are
-stored as anonymous leaves, and the view constant rebuilds its value.  An anonymous leaf is read
-only through the view holding it.  The names that expose the representation (Abs, Rep, the
-definitions) cannot be reached by any input.  Proofs inside rewrite with fixed rules
-only.  A selector simproc synthesizes the equations of the selectors on instances, views and
-truncate.  The selector Simpset rewrites with these simprocs and with no rule of the theory's
-simpset; as in simp, what its congruence rules assume (P in P --> Q, x : A under a bounded
-quantifier) rewrites the other side.  It is used through selector_rewrite, selector_conv,
-selector_simp_tac and selector_simplify only, each call within a bound on the simplifier steps.
+slot, with a constructor of the layer and an accessor constant of each leaf and of more.  All
+chains start at the base concept "concept", whose single bool leaf is read by the predicate
+concept.  A parent with a qualifier is a view: its leaves not given by "where" are stored as
+anonymous leaves, and the view constant rebuilds its value.  An anonymous leaf is read only
+through the view holding it.  The constructors, the accessors of anonymous leaves and the names
+that expose the representation (Abs, Rep, the definitions) cannot be reached by any input.  Only
+the declaration of a layer uses the representation: it proves what the accessors read of the
+constructors, and every later proof rests on these theorems and on the definitions of the
+instances, views and truncations, whose right-hand sides are nested constructors: a leaf is
+read by instantiating them, and two structures are compared leaf by leaf.  A selector simproc
+synthesizes the equations of the selectors on instances, views and truncate.  The
+selector Simpset rewrites with these simprocs and with no rule of the theory's simpset; as in
+simp, what its congruence rules assume (P in P --> Q, x : A under a bounded quantifier) rewrites
+the other side.  It is used through selector_rewrite, selector_conv, selector_simp_tac and
+selector_simplify only, each call within a bound on the simplifier steps.
 *)
 
 signature CONCEPT_TYPE =
@@ -79,17 +84,20 @@ struct
 
 type parent = typ list * string;
 
-(*acc: the selector constant of a named leaf, a lambda term over the scheme for an anonymous
-  one; conv: acc applied to the canonical term = the leaf's argument*)
+(*acc: the accessor constant, the selector of a named leaf; conv: acc applied to the canonical
+  term = the leaf's argument*)
 type leaf = {name: string option, typ: typ, acc: term, conv: thm};
 
+(*The canonical term of a layer: the constructors of the layers from the base to it, each applied
+  to its leaves and to the next one, the last to more.  split, with L the next layer toward the
+  base, which has none: (L.more ?X = L.more ?Y) = (the leaves of the layer agree and its more
+  does).  truncate_def: truncate ?r == the canonical term of the accessors applied to ?r, with
+  more ()*)
 type layer =
  {ext: string,  (*the extension type constructor*)
-  abs: term, leaves: leaf list, more_conv: thm,
-  defs: thm list,  (*the definitions of the selectors and of more*)
-  abs_inverse: thm,  (*Rep (Abs x) = x*)
-  rep_inject: thm,  (*(Rep x = Rep y) = (x = y)*)
-  equality: thm, surjective: thm, truncate: term, truncate_def: thm, truncate_conv: thm};
+  constructor: term,  (*of the layer: the leaves, then more*)
+  leaves: leaf list, more_conv: thm, equality: thm, surjective: thm, split: thm option,
+  truncate: term, truncate_def: thm};
 
 (*a leaf of a view's parent: the leaf of the declaring concept that it is, or a value given by
   the declaring concept's where clause that is no leaf (the declaring concept, the value)*)
@@ -97,11 +105,11 @@ datatype slot = Leaf of int | Given of string * term;
 
 (*const: at the declaring concept's own type arguments; parent and more, the type of the more
   slot of the view's values: at the same; slots: one per leaf of the parent, and one for the
-  more slot unless more is unit; values: the definition's value of each slot, in the variable
-  S; concept_eq: concept (C.q S) = True*)
+  more slot unless more is unit; def: C.q ?S == its canonical term; concept_eq:
+  concept (C.q ?S) = True*)
 type view_entry =
  {name: string, qualifier: string, const: term, parent: parent, more: typ,
-  slots: slot list, S: term, values: term list, def: thm, concept_eq: thm};
+  slots: slot list, def: thm, concept_eq: thm};
 
 (*owner: the concept owning the type (itself if it has a layer);
   scheme: the type of the values, the more slot a type variable;
@@ -122,9 +130,9 @@ type source =
 
 (*an instance constant applied to its parameters: the value of each leaf, more, and the
   premises of the instance, whose conjunction is the base's leaf; wholes: the views given as a
-  whole, each by the view constants from the instance outward, with the value; concept_eq:
-  concept (x params) = that conjunction; implications: concept (x ?params) ==> concept ?param,
-  by the parameter's position;
+  whole, each by the view constants from the instance outward, with the value; def:
+  x ?params == its canonical term; concept_eq: concept (x params) = that conjunction;
+  implications: concept (x ?params) ==> concept ?param, by the parameter's position;
   agreed: x ?params == x ?params ==> u == v for a value u stored for a leaf and another value v
   given to it that was compared as the same, the premise being there for the instantiation*)
 type instance_entry =
@@ -136,20 +144,19 @@ type instance_entry =
 (*the theorems of what is stored: stored without their theory, handed out in the theory that
   asks*)
 fun map_layer_thms f
-    ({ext, abs, leaves, more_conv, defs, abs_inverse, rep_inject, equality, surjective, truncate,
-      truncate_def, truncate_conv}: layer) : layer =
-  {ext = ext, abs = abs,
+    ({ext, constructor, leaves, more_conv, equality, surjective, split, truncate,
+      truncate_def}: layer) : layer =
+  {ext = ext, constructor = constructor,
    leaves =
     map (fn {name, typ, acc, conv} => {name = name, typ = typ, acc = acc, conv = f conv}) leaves,
-   more_conv = f more_conv, defs = map f defs, abs_inverse = f abs_inverse,
-   rep_inject = f rep_inject, equality = f equality, surjective = f surjective,
-   truncate = truncate, truncate_def = f truncate_def, truncate_conv = f truncate_conv};
+   more_conv = f more_conv, equality = f equality, surjective = f surjective,
+   split = Option.map f split,
+   truncate = truncate, truncate_def = f truncate_def};
 
 fun map_view_thms f
-    ({name, qualifier, const, parent, more, slots, S, values, def, concept_eq}: view_entry)
-    : view_entry =
+    ({name, qualifier, const, parent, more, slots, def, concept_eq}: view_entry) : view_entry =
   {name = name, qualifier = qualifier, const = const, parent = parent, more = more,
-   slots = slots, S = S, values = values, def = f def, concept_eq = f concept_eq};
+   slots = slots, def = f def, concept_eq = f concept_eq};
 
 fun map_entry_thms f ({name, args, parent, owner, layer, scheme, more, views}: entry) : entry =
   {name = name, args = args, parent = parent, owner = owner,
@@ -366,7 +373,9 @@ fun get_instance thy = Option.map instance_of o get_instance_entry thy;
 
 datatype const_kind =
   Leaf_Sel of int  (*a named leaf: its index among the leaves of every concept having it*)
+| Anon_Sel of int  (*the accessor of an anonymous leaf: the same index*)
 | More_Sel of string  (*the more of the layer of this concept*)
+| Constructor of string  (*the constructor of the layer of this concept*)
 | View_Const of string  (*a view, declared by this concept*)
 | Truncate of string  (*the truncate of the layer of this concept*)
 | Predicate;  (*the base's predicate*)
@@ -395,6 +404,16 @@ fun app thy f x =
 fun matcher thy const T =
   let val tyenv = Sign.typ_match thy (Logic.varifyT_global (fastype_of const), T) Vartab.empty
   in Envir.subst_term_types tyenv o Logic.varify_types_global end;
+
+(*a stored constant f (type variables as TFree) applied to xs, its type instantiated by matching
+  the types of its arguments against those of xs*)
+fun apps thy f xs =
+  let
+    val f' = Logic.varify_types_global f;
+    val tyenv =
+      fold (Sign.typ_match thy)
+        (take (length xs) (binder_types (fastype_of f')) ~~ map fastype_of xs) Vartab.empty;
+  in list_comb (Envir.subst_term_types tyenv f', xs) end;
 
 fun const_of thy c = Const (c, Logic.unvarifyT_global (Sign.the_const_type thy c));
 
@@ -437,13 +456,14 @@ fun layers_from thy layer =
 
 (*a leaf of the values of a concept: typ at the actual types; acc as stored, at the owner's own
   types (apply it with app); owner: the concept whose layer has it*)
-type flat_leaf = {name: string option, typ: typ, acc: term, owner: string};
+type flat_leaf = {name: string option, typ: typ, acc: term, conv: thm, owner: string};
 
 (*the leaves of the values of a concept at type arguments Ts, root first, without the base's;
   a leaf has the same index in every concept whose values have it*)
 fun flat_leaves thy p : flat_leaf list =
   tl (chain thy p) |> maps (fn (owner, Us) =>
-    map2 (fn {name, acc, ...} => fn U => {name = name, typ = U, acc = acc, owner = owner})
+    map2 (fn {name, acc, conv, ...} => fn U =>
+        {name = name, typ = U, acc = acc, conv = conv, owner = owner})
       (#leaves (the_layer thy owner)) Us);
 
 fun leaf_count thy name = length (flat_leaves thy (map TFree (#args (the_entry thy name)), name));
@@ -481,36 +501,20 @@ fun dest_scheme_type thy T = get_first (match_scheme thy T) (rev (type_layers th
 fun parent_of_type thy T = Option.map (fn (name, Ts, _) => (Ts, name)) (dest_scheme_type thy T);
 
 
-(* balanced layout of a layer *)
+(* canonical terms *)
 
-val layerT = Balanced_Tree.make HOLogic.mk_prodT;
-val mk_layer = Balanced_Tree.make HOLogic.mk_prod;
-
-(*the components of a balanced tree of pairs with m leaves, as built by Balanced_Tree.make*)
-fun projs 1 t = [t]
-  | projs m t =
-      let val k = m div 2
-      in projs k (HOLogic.mk_fst t) @ projs (m - k) (HOLogic.mk_snd t) end;
-
-(*split an equation between two layers into one equation per component*)
-fun split_tac _ 1 _ = all_tac
-  | split_tac ctxt m i =
-      let val k = m div 2 in
-        resolve_tac ctxt @{thms prod_eqI} i THEN
-        split_tac ctxt (m - k) (i + 1) THEN split_tac ctxt k i
-      end;
-
-(*the canonical term over the layers abss, each with its leaves, innermost more last*)
-fun whole_of thy abss leavess more =
-  fold_rev (fn (a, ts) => fn t => app thy a (mk_layer (ts @ [t]))) (abss ~~ leavess) more;
+(*the canonical term over the constructors of the layers, each with its leaves, innermost more
+  last*)
+fun whole_of thy constructors leavess more =
+  fold_rev (fn (c, ts) => fn t => apps thy c (ts @ [t])) (constructors ~~ leavess) more;
 
 (*a value of a concept: the base's leaf, the other leaves (flat_leaves order), and more*)
 fun mk_value thy p base ts more =
   let
     val layers = chain thy p;
-    val abss = map (#abs o the_layer thy o #1) layers;
+    val constructors = map (#constructor o the_layer thy o #1) layers;
     val leavess = [base] :: unflat (map #2 (tl layers)) ts;
-  in whole_of thy abss leavess more end;
+  in whole_of thy constructors leavess more end;
 
 
 (* printing *)
@@ -786,8 +790,10 @@ fun node_leaves thy (p as (_, name), more) : flat_leaf list =
   flat_leaves thy p @
     (if more = HOLogic.unitT then []
      else
-      [{name = NONE, typ = more, acc = #more (the_entry thy name),
-        owner = #owner (the_entry thy name)}]);
+      let val owner = #owner (the_entry thy name) in
+        [{name = NONE, typ = more, acc = #more (the_entry thy name),
+          conv = #more_conv (the_layer thy owner), owner = owner}]
+      end);
 
 (*resolve the where clauses in the node of p with the more slot of type more; owner names the
   node as the user named it; a clause may not reach a leaf that the parent's where clause
@@ -904,10 +910,9 @@ val step_bound = 1000;
 
 fun bounded f = Simp_Steps.limited step_bound f;
 
-(*the context for rewriting with the fixed rules of this package and with given definitions
-  alone: no bound counts these steps.  Such rewriting always ends, in a number of steps that
-  grows with the structure, and runs neither the selector Simpset nor any rule or assumption
-  of a user; so a unit that never ends still takes ever more counted steps*)
+(*the context for unfolding one given definition: no bound counts these steps.  Such rewriting
+  always ends, and runs neither the selector Simpset nor any rule or assumption of a user; so a
+  unit that never ends still takes ever more counted steps*)
 fun uncounted ctxt =
   Simp_Steps.inherit (Proof_Context.init_global (Proof_Context.theory_of ctxt)) ctxt;
 
@@ -998,17 +1003,6 @@ fun instance_subst m ({params, ...}: instance_entry) args = subst_free (map m pa
 fun instance_term thy (inst as {const, ...}: instance_entry) T =
   instance_subst (matcher thy const T) inst;
 
-(*an instance at the actual type T of its constant, applied to args: values, more*)
-fun instance_at thy (inst as {values, more, ...}: instance_entry) T args =
-  let val subst = instance_term thy inst T args in (map subst values, subst more) end;
-
-(*the structure t from which a structure of concept name has what lies beyond the layers of
-  its type: its more is stored as L.more t, L owning the last of these layers*)
-fun beyond thy name more =
-  (case more of
-    Const (mc, _) $ t => if mc = dest_Const_name (#more (the_entry thy name)) then SOME t else NONE
-  | _ => NONE);
-
 fun the_view thy d c = the (find_first (fn {name, ...} => name = c) (#views (the_entry thy d)));
 
 (*what a constant is to the simproc; nothing is instantiated*)
@@ -1039,106 +1033,165 @@ fun dest_head thy w =
 fun dest_truncation thy w =
   (case dest_head thy w of SOME (Truncate_Head P, _, [u]) => SOME (P, u) | _ => NONE);
 
-(*leaf j of a structure w as a term: the selector applied to w for a named leaf; for an
-  anonymous one its value from w's head, else the read through its view*)
-fun leaf_term thy j w =
-  (case parent_of_type thy (fastype_of w) of
-    NONE => NONE
-  | SOME p =>
-      (case nth (flat_leaves thy p) j of
-        {name = SOME _, ...} => SOME (read_leaf thy p j w)
-      | _ => (case leaf_value thy j w of NONE => SOME (read_leaf thy p j w) | some => some)))
+(*a meta equation, with premises or without, instantiated so that its left side is ct*)
+fun at_cterm ct th =
+  let
+    val th' = Thm.incr_indexes (Thm.maxidx_of_cterm ct + 1) th;
+    val lhs = Thm.dest_equals_lhs (Thm.cconcl_of th');
+  in Thm.instantiate (Thm.match (lhs, ct)) th' end;
 
-(*the value of leaf j of a structure w, one step from the definition of its head; a leaf beyond
-  the layers of the head's type is that of the structure whose more the head stores*)
-and leaf_value thy j w =
-  let fun stored name more = Option.mapPartial (leaf_term thy j) (beyond thy name more) in
+
+(* reading a structure *)
+
+(*the structure w == its canonical term: by the definition of its head; a term that a
+  constructor makes is one already*)
+fun unfolded ctxt w =
+  let
+    val thy = Proof_Context.theory_of ctxt;
+    val ct = Thm.cterm_of ctxt w;
+  in
     (case dest_head thy w of
-      SOME (Instance_Head (inst as {concept = (_, name), ...}), T, args) =>
-        let val (values, more) = instance_at thy inst T args
-        in if j < length values then SOME (nth values j) else stored name more end
-    | SOME (View_Head (view as {parent = (_, r), ...}), T, [w']) =>
-        if j < leaf_count thy r then view_slot thy view T w' j
-        else Option.mapPartial (stored r) (view_more thy view T w')
-    | SOME (Truncate_Head d, _, [r]) => if j < leaf_count thy d then leaf_term thy j r else NONE
+      SOME (Instance_Head {def, ...}, _, _) => SOME (at_cterm ct def)
+    | SOME (View_Head {def, ...}, _, _) => SOME (at_cterm ct def)
+    | SOME (Truncate_Head d, _, _) => SOME (at_cterm ct (#truncate_def (the_layer thy d)))
+    | NONE =>
+        (case Term.head_of w of
+          Const (c, _) =>
+            (case get_kind thy c of SOME (Constructor _) => SOME (Thm.reflexive ct) | _ => NONE)
+        | _ => NONE))
+  end;
+
+(*for the accessor constant c applied to a structure of concept p: the layer that it reads, and
+  what it reads of a canonical term*)
+fun accessor thy p c =
+  let
+    fun leaf j =
+      let val {owner, conv, ...} = nth (flat_leaves thy p) j in SOME (owner, meta conv) end;
+  in
+    (case get_kind thy c of
+      SOME (Leaf_Sel j) => leaf j
+    | SOME (Anon_Sel j) => leaf j
+    | SOME (More_Sel d) => SOME (d, meta (#more_conv (the_layer thy d)))
+    | SOME Predicate =>
+        let val base = base_name thy
+        in SOME (base, meta (#conv (hd (#leaves (the_layer thy base))))) end
+    | _ => NONE)
+  end;
+
+(*ct = L.more t == the constructors of the layers after L down to K, applied to what the
+  accessors read of t: the surjective of K at t, read by the more_conv of L*)
+fun written_out thy K ct =
+  let
+    val (more, t) = Thm.dest_comb ct;
+    val L =
+      (case get_kind thy (dest_Const_name (Thm.term_of more)) of
+        SOME (More_Sel L) => L
+      | _ => raise CTERM ("written_out", [ct]));
+    fun at ct' select layer = at_cterm ct' (meta (select (the_layer thy layer)));
+    val th = Thm.combination (Thm.reflexive more) (at t #surjective K);
+  in Thm.transitive th (at (Thm.rhs_of th) #more_conv L) end;
+
+(*the accessor constant of slot r of a node of concept p, the more slot after the leaves*)
+fun slot_accessor thy p r =
+  if is_more thy p r then #more (the_entry thy (#2 p)) else #acc (nth (flat_leaves thy p) r);
+
+(*ct, an accessor constant applied to a structure w that has a head or is a canonical term ==
+  what it reads of the canonical term of w.  Where it reads a layer K that the term does not
+  write out, the last more slot of the term is first made the constructors down to K, in two
+  steps: the accessor of an anonymous leaf there is put as users see it; then L.more t is written
+  out, so that the rest is read of t, unless t is w itself, whose more would be read of its more
+  for ever*)
+fun read ctxt ct =
+  let
+    val thy = Proof_Context.theory_of ctxt;
+    val (acc, w) = Thm.dest_comb ct;
+    fun slot K ct' =
+      let val th = shown ctxt (Thm.reflexive ct') in
+        (case Thm.term_of (Thm.rhs_of th) of
+          Const (c, _) $ t =>
+            (case (get_kind thy c, t aconv Thm.term_of w) of
+              (SOME (More_Sel _), false) => Thm.transitive th (written_out thy K (Thm.rhs_of th))
+            | _ => raise CTERM ("read", [ct']))
+        | _ => raise CTERM ("read", [ct']))
+      end;
+    (*through the constructors to the last more slot*)
+    fun deepen K ct' =
+      (case Term.head_of (Thm.term_of ct') of
+        Const (c, _) =>
+          (case get_kind thy c of
+            SOME (Constructor _) => Conv.arg_conv (deepen K) ct'
+          | _ => slot K ct')
+      | _ => slot K ct');
+    (*th: ct == acc applied to a canonical term*)
+    fun project (K, conv) th =
+      let
+        fun component th' = Thm.transitive th' (at_cterm (Thm.rhs_of th') conv);
+        fun deepened () = Thm.transitive th (Conv.arg_conv (deepen K) (Thm.rhs_of th));
+      in
+        (case try component th of
+          SOME th' => SOME th'
+        | NONE => try (component o deepened) ())
+      end;
+  in
+    (case
+      (Option.mapPartial (fn p => accessor thy p (dest_Const_name (Thm.term_of acc)))
+        (parent_of_type thy (Thm.typ_of_cterm w)),
+       unfolded ctxt (Thm.term_of w))
+     of
+      (SOME reads, SOME def) => project reads (Thm.combination (Thm.reflexive acc) def)
     | _ => NONE)
   end
 
-(*the value of slot j of a view at the type T of its constant, applied to w'*)
-and view_slot thy ({const, slots, S, values, ...}: view_entry) T w' j =
-  (case nth slots j of
-    Leaf i => leaf_term thy i w'
-  | Given _ =>
-      let val m = matcher thy const T
-      in SOME (subst_free [(m S, w')] (m (nth values j))) end)
+(*ct == ct as users see it: the accessor of an anonymous leaf applied to a structure is the read
+  through the views holding the leaf, as read_leaf writes it; any other term is left*)
+and folded ctxt ct =
+  let val thy = Proof_Context.theory_of ctxt in
+    (case Thm.term_of ct of
+      Const (c, _) $ u =>
+        (case get_kind thy c of
+          SOME (Anon_Sel k) =>
+            let
+              val (_, view, parent, r) = holder thy (the (parent_of_type thy (fastype_of u))) k;
+              val ct' = Thm.cterm_of ctxt (app thy (slot_accessor thy parent r) (app thy view u));
+            in Thm.transitive (Thm.symmetric (the (read ctxt ct'))) (folded ctxt ct') end
+        | _ => Thm.reflexive ct)
+    | _ => Thm.reflexive ct)
+  end
 
-(*the value of the more slot of a view with one, unless it is known only as the more of the
-  view itself*)
-and view_more thy (view as {const, slots, parent = (_, r), ...}: view_entry) T w' =
-  let val n = leaf_count thy r in
-    if length slots = n then NONE
-    else
-      view_slot thy view T w' n
-      |> Option.mapPartial (fn m =>
-        if beyond thy r m = SOME (matcher thy const T const $ w') then NONE else SOME m)
-  end;
-
-(*the value of the more of the layer of concept d of a structure w*)
-fun more_value thy d w =
-  let
-    (*the more of the last layer L of the head's type is m: the more of L itself, that of a
-      layer beyond*)
-    fun stored name m =
-      let val L = #owner (the_entry thy name) in
-        if d = L then SOME m
-        else if member (op =) (layers_from thy L) d then NONE
-        else Option.map (app thy (#more (the_entry thy d))) (beyond thy name m)
-      end;
-  in
-    (case dest_head thy w of
-      SOME (Instance_Head (inst as {concept = (_, name), ...}), T, args) =>
-        stored name (#2 (instance_at thy inst T args))
-    | SOME (View_Head (view as {slots, parent = (_, r), ...}), T, [w']) =>
-        if length slots = leaf_count thy r
-        then if d = #owner (the_entry thy r) then SOME HOLogic.unit else NONE
-        else Option.mapPartial (stored r) (view_more thy view T w')
-    | SOME (Truncate_Head e, _, _) => if d = e then SOME HOLogic.unit else NONE
-    | _ => NONE)
-  end;
-
-fun add_tycos (Type (c, Ts)) = insert (op =) c #> fold add_tycos Ts
-  | add_tycos _ = I;
-
-(*the fixed rules that unfold the structures in ts down to their leaves*)
-fun unfold_rules thy ts =
-  let
-    val owners = Symtab.lookup (#owners (Data.get thy));
-    val layers =
-      fold (Term.fold_types add_tycos) ts [] |> map_filter owners |> map (the_layer thy);
-    fun def_of c =
-      (case head_of thy c of
-        SOME (Instance_Head {def, ...}) => [def]
-      | SOME (View_Head {def, ...}) => [def]
-      | SOME (Truncate_Head d) => [#truncate_def (the_layer thy d)]
-      | NONE => []);
-  in
-    maps #defs layers @ map (meta o #abs_inverse) layers @
-    maps def_of (fold Term.add_const_names ts []) @ map meta @{thms fst_conv snd_conv}
-  end;
-
-(*a term unfolded down to its leaves: the fixed rules of the constants in it and of those that
-  the unfolding brings up; defs: the definitions of constants that the theory does not know yet*)
-fun unfold_conv ctxt defs ct =
+(*an equation as users see its right side: the accessor of an anonymous leaf is read on where
+  its structure can be read, else written as the read through its view*)
+and shown ctxt th =
   let
     val thy = Proof_Context.theory_of ctxt;
-    fun unfold th =
-      let
-        val ct' = Thm.rhs_of th;
-        val rules = defs @ unfold_rules thy [Thm.term_of ct'];
-        val th' = Raw_Simplifier.rewrite_wrt (uncounted ctxt) false rules ct';
-      in if Thm.is_reflexive th' then th else unfold (Thm.transitive th th') end;
-    val th = unfold (Thm.reflexive ct);
-  in Thm.transitive th (Thm.eta_conversion (Thm.rhs_of th)) end;
+    val rhs = Thm.rhs_of th;
+  in
+    (case Thm.term_of rhs of
+      Const (c, _) $ _ =>
+        (case get_kind thy c of
+          SOME (Anon_Sel _) =>
+            Thm.transitive th
+              (case read ctxt rhs of SOME th' => shown ctxt th' | NONE => folded ctxt rhs)
+        | _ => th)
+    | _ => th)
+  end;
+
+(*the equation that the selector simproc gives for ct, an accessor constant applied to a
+  structure: none where the right side would be ct itself, or a constructor's application,
+  which no user sees*)
+fun value_equation ctxt ct =
+  let val thy = Proof_Context.theory_of ctxt in
+    Option.map (shown ctxt) (read ctxt ct)
+    |> Option.mapPartial (Option.filter (fn th =>
+      let val rhs = Thm.term_of (Thm.rhs_of th) in
+        not (rhs aconv Thm.term_of ct) andalso
+        (case Term.head_of rhs of
+          Const (c, _) => (case get_kind thy c of SOME (Constructor _) => false | _ => true)
+        | _ => true)
+      end))
+  end;
+
+
+(* structures compared by their leaves *)
 
 (*lhs == rhs: both sides converted to the same term; the variables stay as they are*)
 fun prove_by_conv conv ctxt lhs rhs =
@@ -1146,18 +1199,67 @@ fun prove_by_conv conv ctxt lhs rhs =
     if Thm.rhs_of l aconvc Thm.rhs_of r then SOME (Thm.transitive l (Thm.symmetric r)) else NONE
   end;
 
-(*both sides unfolded to the same normal form, compared modulo eta*)
-fun prove_select_with ctxt defs = prove_by_conv (unfold_conv ctxt defs) ctxt;
+(*th continued: where its right side is an accessor constant applied to a structure that ok
+  holds of, that is read, for as long as it can be*)
+fun read_on ctxt ok th =
+  (case Thm.term_of (Thm.rhs_of th) of
+    Const _ $ w =>
+      (case if ok w then read ctxt (Thm.rhs_of th) else NONE of
+        SOME th' => read_on ctxt ok (Thm.transitive th th')
+      | NONE => th)
+  | _ => th);
 
-fun prove_select ctxt = prove_select_with ctxt [];
+(*ct, an accessor constant applied to a structure, as it is compared: read on to the end, then
+  rewritten by the selector Simpset*)
+fun leaf_conv ctxt = read_on ctxt (K true) o Thm.reflexive then_conv selector_conv ctxt;
 
-(*lhs = rhs as a theorem of the theory, the variables xs and all types schematic*)
-fun prove_unfold thy defs xs lhs rhs =
-  Goal.prove_sorry_global thy xs [] (HOLogic.mk_Trueprop (HOLogic.mk_eq (lhs, rhs)))
-    (fn {context = ctxt, ...} =>
-      (case prove_select_with ctxt defs lhs rhs of
-        SOME th => resolve_tac ctxt [th RS @{thm meta_eq_to_obj_eq}] 1
-      | NONE => no_tac));
+(*t = u for what accessors make of two structures*)
+fun same_leaf ctxt (t, u) =
+  prove_by_conv (leaf_conv ctxt) ctxt t u
+  |> Option.map (fn th => th RS @{thm meta_eq_to_obj_eq});
+
+fun mk_concept thy t = Const (base_name thy, fastype_of t --> HOLogic.boolT) $ t;
+
+(*what the predicate concept, the accessors of the leaves and the last more make of a structure
+  of the layer L at the types Ts*)
+fun accessed thy (L, Ts) z =
+  mk_concept thy z :: map (fn {acc, ...} => app thy acc z) (flat_leaves thy (Ts, L)) @
+    [app thy (#more (the_entry thy L)) z];
+
+(*x = y for two structures of the layer L, from the equations of what is accessed of them*)
+fun by_equality thy L eqs =
+  if forall is_some eqs then SOME (#equality (the_layer thy L) OF map the eqs) else NONE;
+
+(*x = y for two structures of one type: what is accessed of them agrees*)
+fun structure_equation ctxt x y =
+  let val thy = Proof_Context.theory_of ctxt in
+    dest_scheme_type thy (fastype_of x) |> Option.mapPartial (fn (L, Ts, _) =>
+      by_equality thy L
+        (map (same_leaf ctxt) (accessed thy (L, Ts) x ~~ accessed thy (L, Ts) y)))
+  end;
+
+(*concept.more x = concept.more y for two structures of one type: the leaves after the base's
+  and the last more agree; by the splits of the layers, from the last to the first*)
+fun base_more_equation ctxt x y =
+  let val thy = Proof_Context.theory_of ctxt in
+    (case dest_scheme_type thy (fastype_of x) of
+      SOME (L, Ts, _) =>
+        let
+          fun same f = same_leaf ctxt (app thy f x, app thy f y);
+          (*eq: the more of the layer agrees; then that of the layer below it does*)
+          fun below layer eq =
+            let
+              val {leaves, split, ...} = the_layer thy layer;
+              val eqs = map (same o #acc) leaves @ [eq];
+            in
+              if forall is_some eqs then
+                SOME (@{thm iffD2} OF
+                  [the split, foldr1 (fn (th, th') => @{thm conjI} OF [th, th']) (map the eqs)])
+              else NONE
+            end;
+        in fold_rev below (map #1 (tl (chain thy (Ts, L)))) (same (#more (the_entry thy L))) end
+    | NONE => NONE)
+  end;
 
 
 (** the cache of the equations **)
@@ -1169,6 +1271,9 @@ fun prove_unfold thy defs xs lhs rhs =
 val cache =
   Synchronized.var "Concept_Type.cache"
     (0, Termtab.empty: (int * thm Unsynchronized.weak_ref) Termtab.table);
+
+fun add_tycos (Type (c, Ts)) = insert (op =) c #> fold add_tycos Ts
+  | add_tycos _ = I;
 
 (*the finished ancestor theory that has every constant and type constructor of t, in which t
   certifies and its constants have well-sorted types, if any: what is proved there serves all
@@ -1238,13 +1343,6 @@ fun cached ctxt key prove =
     | NONE => proved ())
   end;
 
-(*a meta equation, with premises or without, instantiated so that its left side is ct*)
-fun at_cterm ct th =
-  let
-    val th' = Thm.incr_indexes (Thm.maxidx_of_cterm ct + 1) th;
-    val lhs = Thm.dest_equals_lhs (Thm.cconcl_of th');
-  in Thm.instantiate (Thm.match (lhs, ct)) th' end;
-
 (*a structure with its instance, view and truncate constants kept and every other term in it
   replaced by a schematic variable, equal terms by one variable*)
 fun skeleton thy w (seen: (term * term) list) =
@@ -1262,14 +1360,12 @@ fun skeleton thy w (seen: (term * term) list) =
 
 (*the value of a selector on a structure as it is stored, ct being the selector applied to the
   structure: the equation is that of the skeleton of the structure*)
-fun stored_value ctxt value ct =
+fun stored_value ctxt ct =
   let
     val (f, w) = Term.dest_comb (Thm.term_of ct);
     val (w', _) = skeleton (Proof_Context.theory_of ctxt) w [];
     val key = f $ w';
-    fun prove ctxt' =
-      value (Proof_Context.theory_of ctxt') w' |> Option.mapPartial (fn rhs =>
-        if rhs aconv key then NONE else prove_select ctxt' key rhs);
+    fun prove ctxt' = value_equation ctxt' (Thm.cterm_of ctxt' key);
   in
     if is_Var w' then NONE
     else Option.map (at_cterm ct) (cached ctxt key prove)
@@ -1329,8 +1425,8 @@ val pattern_values = Config.declare_bool ("concept_pattern_values", \<^here>) (K
 
 (*the value of a selector on a structure, ct being the selector applied to it; none for a value
   that begins with a pattern*)
-fun select ctxt value ct =
-  stored_value ctxt value ct |> Option.mapPartial (fn th =>
+fun select ctxt ct =
+  stored_value ctxt ct |> Option.mapPartial (fn th =>
     if Config.get ctxt pattern_values orelse
       not (begins_with_pattern ctxt (Thm.term_of (Thm.rhs_of th)))
     then SOME th else NONE);
@@ -1357,12 +1453,12 @@ fun compare_values ctxt t u =
 
 (*a selector on a structure and further arguments, where the value on the structure begins with
   a pattern: that value at the arguments, when they are explicit as far as the pattern goes*)
-fun select_applied ctxt value ct =
+fun select_applied ctxt ct =
   let
     val (f, w :: args) = Drule.strip_comb ct;
     val applied = fold (fn a => fn th => Thm.combination th (Thm.reflexive a)) args;
   in
-    stored_value ctxt value (Thm.apply f w) |> Option.mapPartial (fn th =>
+    stored_value ctxt (Thm.apply f w) |> Option.mapPartial (fn th =>
       if begins_with_pattern ctxt (Thm.term_of (Thm.rhs_of th)) then
         let val th' = applied th
         in Option.map (Thm.transitive th') (reduce ctxt (Thm.rhs_of th')) end
@@ -1402,7 +1498,6 @@ fun put_laws layer laws =
 fun base_equality thy = Thm.transfer thy (the (#1 (Laws.get thy)));
 
 fun mk_truncate thy layer = app thy (#truncate (the_layer thy layer));
-fun mk_concept thy t = Const (base_name thy, fastype_of t --> HOLogic.boolT) $ t;
 fun mk_base_more thy = app thy (#more (the_entry thy (base_name thy)));
 
 val mk_prop_eq = HOLogic.mk_Trueprop o HOLogic.mk_eq;
@@ -1431,7 +1526,13 @@ fun add_laws name thy =
       |> map (fn a => TFree (a, \<^sort>\<open>type\<close>));
     val r = Free ("r", scheme_type thy p m);
     val truncate = mk_truncate thy name;
-    val concept = prove_unfold thy [] ["r"] (mk_concept thy (truncate r)) (mk_concept thy r);
+    (*lhs = rhs as a theorem of the theory, r and all types schematic*)
+    fun prove lhs rhs equation =
+      Goal.prove_sorry_global thy ["r"] [] (mk_prop_eq (lhs, rhs)) (fn {context = ctxt, ...} =>
+        (case equation ctxt of SOME th => resolve_tac ctxt [th] 1 | NONE => no_tac));
+    val concept =
+      prove (mk_concept thy (truncate r)) (mk_concept thy r) (fn ctxt =>
+        same_leaf ctxt (mk_concept thy (truncate r), mk_concept thy r));
     val r0 = Free ("r", unit_type thy p);
     val ident =
       Goal.prove_sorry_global thy ["r"] [] (mk_prop_eq (truncate r0, r0))
@@ -1452,17 +1553,18 @@ fun add_laws name thy =
         val base_more = mk_base_more thy;
         val u = Free ("u", scheme_type thy p m) and v = Free ("v", scheme_type thy p n);
         val x = Free ("x", unit_type thy p);
-        val merged = prove_unfold thy [] ["r"] (truncate' (truncate r)) (truncate' r);
+        val merged =
+          prove (truncate' (truncate r)) (truncate' r) (fn ctxt =>
+            structure_equation ctxt (truncate' (truncate r)) (truncate' r));
         (*the concept.more of L'.truncate from that of L.truncate: put under the base again*)
         val y = Free ("y", fastype_of (base_more x));
-        val base_abs = #abs (the_layer thy (base_name thy));
-        val rebuild =
-          lambda y
-            (base_more
-              (truncate' (app thy base_abs (HOLogic.mk_prod (\<^Const>\<open>True\<close>, y)))));
+        val base_constructor = #constructor (the_layer thy (base_name thy));
+        fun rebuilt z = truncate' (apps thy base_constructor [\<^Const>\<open>True\<close>, z]);
+        val rebuild = lambda y (base_more (rebuilt y));
         val split =
-          prove_unfold thy [] ["r"] (betapply (rebuild, base_more (truncate r)))
-            (base_more (truncate' r));
+          prove (base_more (rebuilt (base_more (truncate r)))) (base_more (truncate' r))
+            (fn ctxt =>
+              base_more_equation ctxt (rebuilt (base_more (truncate r))) (truncate' r));
       in
         (lift thy [] (u, v) truncate truncate' (lambda x (truncate' x)) merged,
           lift thy [] (u, v) (base_more o truncate) (base_more o truncate') rebuild split)
@@ -1735,14 +1837,16 @@ fun rule_at context (c, i) n =
   |> Option.mapPartial
     (Option.filter (fn rule => rule_arity (Context.theory_of context) c rule = n));
 
-(*a term rewritten: the definition def unfolded, then the selector Simpset, then for a constant
-  of this package the fixed rules down to the leaves*)
-fun cong_conv ctxt own def =
+(*a term rewritten: the definition def unfolded, then the selector Simpset; modulo eta*)
+fun cong_conv ctxt def =
   Raw_Simplifier.rewrite_wrt (uncounted ctxt) false [def] then_conv
-  selector_conv ctxt then_conv
-  (if own then unfold_conv ctxt [] else Thm.eta_conversion);
+  selector_conv ctxt then_conv Thm.eta_conversion;
 
-fun prove_cong_meta ctxt own def = prove_by_conv (cong_conv ctxt own def) ctxt;
+(*lhs == rhs, for terms that a constant makes of a structure and of its truncation: by its
+  definition def; for a constant of this package, which makes structures, by their leaves*)
+fun prove_cong_meta ctxt own def lhs rhs =
+  if own then Option.map meta (structure_equation ctxt lhs rhs)
+  else prove_by_conv (cong_conv ctxt def) ctxt lhs rhs;
 
 (*one attempt, a bounded unit: none where the two sides differ or the steps do not suffice*)
 fun prove_cong ctxt own def lhs rhs =
@@ -1810,9 +1914,9 @@ fun derive_cong ctxt names {const = f, def, position = i} =
 
 fun derive_truncate_cong ctxt = derive_cong ctxt NONE;
 
-(*c xs[i := P.truncate x] = P.truncate (c xs) as a meta equation, for variables xs of the types
-  of args, x at the position i, where the constant c has the mark Commutes: proved from the
-  definition in the mark as the theory of the proof has it*)
+(*c xs[i := P.truncate x] = P.truncate (c xs) as a meta equation, for the variables xs = ?x0,
+  ?x1, ... of the types of args, x at the position i, where the constant c has the mark
+  Commutes: proved from the definition in the mark as the theory of the proof has it*)
 fun commuting ctxt P c i args =
   let
     val truncate = mk_truncate (Proof_Context.theory_of ctxt) P;
@@ -1821,13 +1925,15 @@ fun commuting ctxt P c i args =
     val xs' = nth_map i (K (truncate x)) xs;
     val g = Const (c, map fastype_of xs ---> fastype_of x);
     val g' = Const (c, map fastype_of xs' ---> fastype_of (truncate x));
+    val lhs = list_comb (g', xs');
     fun prove ctxt' =
       (case truncate_cong (Context.Proof ctxt') (c, i) of
         SOME (Commutes {def, ...}) =>
-          prove_cong_meta ctxt' (is_own (Proof_Context.theory_of ctxt') c) def
-            (list_comb (g', xs')) (truncate (list_comb (g, xs)))
+          prove_cong_meta ctxt' (is_own (Proof_Context.theory_of ctxt') c) def lhs
+            (truncate (list_comb (g, xs)))
       | _ => NONE);
-  in cached ctxt (list_comb (g', xs')) prove end;
+    (*a proof by the leaves gives the variables other indexes*)
+  in Option.map (at_cterm (Thm.cterm_of ctxt lhs)) (cached ctxt lhs prove) end;
 
 (*c args[i := P.truncate u] = P.truncate (c args), where args has u at the position i*)
 fun commuting_at ctxt P c i args =
@@ -1920,38 +2026,49 @@ fun split_proc ctxt t =
 
 (** views given as a whole **)
 
-(*x = y as a meta equation, for a view x and a structure y of its type with the same leaves and
-  more; under concept y unless the hidden field of y is True.  agreed: u == v for values of
-  leaves that were compared as the same*)
+(*x = y as a meta equation, for x views of an instance to which a where clause gives the
+  outermost of these views as y; under concept y unless the hidden field of y is True.  What is
+  compared are the leaves and the more of the parent of that view: the slots that the clause
+  gave, not the leaves that the type of y has within that more.  Each is read of x through the
+  views down to the value that the instance stores for it, and that is what the clause read of
+  y, or a value that agreed with it: agreed has u == v for the values stored and given that were
+  compared as the same*)
 fun whole_equation ctxt agreed x y =
-  let val thy = Proof_Context.theory_of ctxt in
-    (case (dest_scheme_type thy (fastype_of x), concept_holds ctxt x) of
-      (SOME (L, Ts, _), SOME cx) =>
+  let
+    val thy = Proof_Context.theory_of ctxt;
+    (*x, and the structures under its views down to the instance*)
+    fun under u = u :: (case dest_head thy u of SOME (View_Head _, _, [w]) => under w | _ => []);
+    val on_the_way = member (op aconv) (under x);
+    (*t = u for what an accessor makes of x and of y: t read down to the value that the instance
+      stores; u as the clause read it, an anonymous leaf through its view; they are one term, or
+      an equation of agreed joins them.  Two terms of type unit are equal*)
+    fun same (t, u) =
+      if fastype_of t = HOLogic.unitT then
+        SOME (Thm.instantiate' [] (map (SOME o Thm.cterm_of ctxt) [t, u])
+          @{lemma "a = (b::unit)" by simp})
+      else
         let
+          val l = read_on ctxt on_the_way (Thm.reflexive (Thm.cterm_of ctxt t));
+          val r = folded ctxt (Thm.cterm_of ctxt u);
+          val joining =
+            if Thm.rhs_of l aconvc Thm.rhs_of r then SOME (Thm.reflexive (Thm.rhs_of l))
+            else
+              agreed |> find_first (fn th =>
+                Thm.rhs_of l aconvc Thm.lhs_of th andalso Thm.rhs_of th aconvc Thm.rhs_of r);
+        in
+          joining |> Option.map (fn th =>
+            Thm.transitive l (Thm.transitive th (Thm.symmetric r)) RS @{thm meta_eq_to_obj_eq})
+        end;
+  in
+    (case (dest_head thy x, concept_holds ctxt x) of
+      (SOME (View_Head {parent = (_, r), ...}, _, _), SOME cx) =>
+        let
+          val L = #owner (the_entry thy r);
+          val (_, Ts, _) = the (match_scheme thy (fastype_of x) L);
           val both = @{lemma "P \<Longrightarrow> Q \<Longrightarrow> P = Q" by simp} OF [cx];
           val hidden = (case concept_holds ctxt y of SOME cy => both OF [cy] | NONE => both);
-          (*a leaf of the two agrees: by unfolding, else through two values that agreed*)
-          fun same acc =
-            let
-              val l = app thy acc x and r = app thy acc y;
-              fun through th =
-                (case
-                  (prove_select ctxt l (Thm.term_of (Thm.lhs_of th)),
-                    prove_select ctxt (Thm.term_of (Thm.rhs_of th)) r)
-                 of
-                  (SOME th1, SOME th2) => SOME (Thm.transitive th1 (Thm.transitive th th2))
-                | _ => NONE);
-            in
-              (case prove_select ctxt l r of NONE => get_first through agreed | some => some)
-              |> Option.map (fn th => th RS @{thm meta_eq_to_obj_eq})
-            end;
-          val leaves =
-            map (same o #acc) (flat_leaves thy (Ts, L)) @ [same (#more (the_entry thy L))];
-        in
-          if forall is_some leaves
-          then SOME (meta (#equality (the_layer thy L) OF (hidden :: map the leaves)))
-          else NONE
-        end
+          val (ts, us) = apply2 (tl o accessed thy (L, Ts)) (x, y);
+        in Option.map meta (by_equality thy L (SOME hidden :: map same (ts ~~ us))) end
     | _ => NONE)
   end;
 
@@ -2001,11 +2118,13 @@ fun selector_proc ctxt ct =
       (case t of
         Const (c, _) $ w =>
           (case get_kind thy c of
-            SOME (Leaf_Sel j) => select ctxt (fn thy' => leaf_value thy' j) ct
-          | SOME (More_Sel d) => select ctxt (fn thy' => more_value thy' d) ct
+            SOME (Leaf_Sel _) => select ctxt ct
+          | SOME (More_Sel _) => select ctxt ct
           | SOME (Truncate P) => truncate_proc ctxt P t w
           | SOME Predicate => predicate_proc ctxt t w
           | SOME (View_Const _) => whole ctxt ct
+          | SOME (Anon_Sel _) => NONE
+          | SOME (Constructor _) => NONE
           | NONE => NONE)
       | Const (\<^const_name>\<open>HOL.eq\<close>, _) $ (Const (c, _) $ _) $ (Const (c', _) $ _) =>
           (case (c = c', get_kind thy c) of
@@ -2015,7 +2134,7 @@ fun selector_proc ctxt ct =
           (case strip_comb t of
             (Const (c, _), _ :: _ :: _) =>
               (case get_kind thy c of
-                SOME (Leaf_Sel j) => select_applied ctxt (fn thy' => leaf_value thy' j) ct
+                SOME (Leaf_Sel _) => select_applied ctxt ct
               | _ => NONE)
           | _ => NONE));
   in if is_some selected then selected else cong_proc ctxt ct end;
@@ -2029,13 +2148,16 @@ fun applied_to thy c n =
   end;
 
 (*the numbers of arguments on which a constant has its simproc by its kind: one, the structure;
-  for a leaf that is a function, also all arguments of the function*)
+  for a leaf that is a function, also all arguments of the function; none for a constructor and
+  for the accessor of an anonymous leaf, which are in no term of a user*)
 fun kind_arities thy c =
   (case get_kind thy c of
     SOME (Leaf_Sel _) =>
       (case length (binder_types (range_type (Sign.the_const_type thy c))) of
         0 => [1]
       | n => [1, n + 1])
+  | SOME (Anon_Sel _) => []
+  | SOME (Constructor _) => []
   | SOME _ => [1]
   | NONE => []);
 
@@ -2048,11 +2170,12 @@ fun add_selector_simproc name lhss context =
          identifier = []});
   in context |> Simplifier.map_simpset add |> map_selector_simpset add end;
 
-(*the split of the more of the layer below that of concept name, whose views are defined; its
-  simproc on the equations at the type of this layer*)
+(*the split of the more of the layer below that of concept name, whose views are defined, as
+  users see it: an anonymous leaf is read through its view; its simproc on the equations at the
+  type of this layer*)
 fun add_split name thy =
   (case (#layer (the_entry thy name), layer_below thy name) of
-    (SOME {rep_inject, leaves, ext, ...}, SOME below) =>
+    (SOME {split = SOME split, leaves, ext, ...}, SOME below) =>
       let
         val {args, more, ...} = the_entry thy name;
         val p = (map TFree args, name);
@@ -2064,16 +2187,17 @@ fun add_split name thy =
         val parts =
           map (fn k => same (read_leaf thy p (offset + k))) (0 upto length leaves - 1) @
             [same (app thy more)];
+        val ctxt = Proof_Context.init_global thy;
+        (*the read of an anonymous leaf through its view == its accessor, on X and on Y*)
+        val accessors =
+          maps (fn {name = NONE, acc, ...}: leaf =>
+              map (fn z => Thm.symmetric (folded ctxt (Thm.cterm_of ctxt (app thy acc z)))) [X, Y]
+            | _ => []) leaves;
         val th =
           Goal.prove_sorry_global thy ["X", "Y"] []
             (mk_prop_eq (lhs, foldr1 HOLogic.mk_conj parts))
-            (fn {context = ctxt, ...} =>
-              rewrite_goals_tac ctxt [meta (rep_inject RS @{thm sym})] THEN
-              CONVERSION (HOLogic.Trueprop_conv (unfold_conv ctxt [])) 1 THEN
-              simp_tac
-                (put_simpset HOL_basic_ss ctxt
-                  |> Simplifier.add_simps @{thms prod_eq_iff conj_assoc}) 1 THEN
-              TRY (resolve_tac ctxt @{thms refl} 1));
+            (fn {context = ctxt', ...} =>
+              rewrite_goals_tac ctxt' accessors THEN resolve_tac ctxt' [split] 1);
       in
         thy
         |> Splits.map (Symtab.update (name, Thm.trim_context th))
@@ -2116,26 +2240,29 @@ fun add_derived_congs f def names thy =
       | NONE => I)) names
   end;
 
-(*a constant the simproc knows, with its simproc*)
+(*what a constant is to this package, with the simproc where its kind gives it one*)
 fun register c kind thy =
   let val thy' = Kinds.map (Symtab.update (c, kind)) thy in
-    thy' |> Context.theory_map
-      (add_selector_simproc c (map (applied_to thy' c) (kind_arities thy' c)))
+    (case kind_arities thy' c of
+      [] => thy'
+    | arities =>
+        thy' |> Context.theory_map (add_selector_simproc c (map (applied_to thy' c) arities)))
   end;
 
-(*the selectors, more and truncate of the layer of concept name; the base's predicate is no
-  selector*)
+(*the constants of the layer of concept name; the base's predicate is no selector*)
 fun register_layer name thy =
   let
     val {parent, layer, more, ...} = the_entry thy name;
-    val {leaves, truncate, ...} = the layer;
+    val {constructor, leaves, truncate, ...} = the layer;
     val offset = (case parent of NONE => 0 | SOME p => length (flat_leaves thy p));
   in
     thy
     |> fold (fn (k, {name = SOME c, ...}: leaf) =>
           register c (if is_none parent then Predicate else Leaf_Sel (offset + k))
-        | _ => I) (map_index I leaves)
+        | (k, {acc, ...}) => register (dest_Const_name acc) (Anon_Sel (offset + k)))
+      (map_index I leaves)
     |> register (dest_Const_name more) (More_Sel name)
+    |> register (dest_Const_name constructor) (Constructor name)
     |> register (dest_Const_name truncate) (Truncate name)
   end;
 
@@ -2319,9 +2446,9 @@ val _ =
 
 (** the fact trigger of Sledgehammer **)
 
-(*a constant with a simproc: one that the simproc knows by its kind, or one with a rule*)
+(*a constant with a simproc: one that its kind gives a simproc, or one with a rule*)
 fun has_simproc ctxt c =
-  is_some (get_kind (Proof_Context.theory_of ctxt) c) orelse
+  not (null (kind_arities (Proof_Context.theory_of ctxt) c)) orelse
   Symtab.defined (Congs.get (Context.Proof ctxt)) c;
 
 fun is_instance ctxt = is_some o get_instance_entry (Proof_Context.theory_of ctxt);
@@ -2944,8 +3071,8 @@ fun add_equality name thy =
                       let
                         val read = read_leaf thy parent r;
                         fun through z =
-                          the (prove_select ctxt (app thy (#acc (nth leaves k)) z)
-                            (read (app thy const z))) RS @{thm meta_eq_to_obj_eq};
+                          folded ctxt (Thm.cterm_of ctxt (app thy (#acc (nth leaves k)) z)) RS
+                            @{thm meta_eq_to_obj_eq};
                         val views = cong ctxt read (fact (same (app thy const)));
                       in
                         @{thm trans} OF
@@ -2995,7 +3122,30 @@ fun abbrev_types b args zeta sT =
   Typedecl.abbrev_global (b, map #1 args, NoSyn)
     (Term.typ_subst_atomic [(TFree zeta, HOLogic.unitT)] sT) #> snd;
 
-(*concept b with a new layer over its parent, entered and its selectors registered; the leaves
+(*the representation of a layer, a typedef over a balanced tuple of its leaves and more: only the
+  declaration of a layer knows it*)
+local
+
+val layerT = Balanced_Tree.make HOLogic.mk_prodT;
+val mk_layer = Balanced_Tree.make HOLogic.mk_prod;
+
+(*the components of a balanced tree of pairs with m leaves, as built by Balanced_Tree.make*)
+fun projs 1 t = [t]
+  | projs m t =
+      let val k = m div 2
+      in projs k (HOLogic.mk_fst t) @ projs (m - k) (HOLogic.mk_snd t) end;
+
+(*split an equation between two layers into one equation per component*)
+fun split_tac _ 1 _ = all_tac
+  | split_tac ctxt m i =
+      let val k = m div 2 in
+        resolve_tac ctxt @{thms prod_eqI} i THEN
+        split_tac ctxt (m - k) (i + 1) THEN split_tac ctxt k i
+      end;
+
+in
+
+(*concept b with a new layer over its parent, entered and its accessors registered; the leaves
   are named or anonymous (empty binding); a named leaf is the constant C.f, or the unqualified f
   for the base's predicate*)
 fun add_layer b args parent bleaves thy0 =
@@ -3037,60 +3187,71 @@ fun add_layer b args parent bleaves thy0 =
     val sT = (case parent of NONE => extT | SOME p => scheme_type thy1 p extT);
     val thy1 = abbrev_types b args zeta sT thy1;
     val r = Free ("r", sT);
-    val rep_r =
-      rep $ (case parent of NONE => r | SOME (_, p) => app thy1 (#more (the_entry thy1 p)) r);
-    val accs = map (lambda r) (projs (n + 1) rep_r);
+    val up_more = Option.map (fn (_, p) => #more (the_entry thy1 p)) parent;
+    val rep_r = rep $ (case up_more of NONE => r | SOME m => app thy1 m r);
 
-    (* constants for the named leaves and for more, with their sealed definitions *)
-    val named =
-      map (fn (x, _) => if Binding.is_empty x then NONE else SOME x) bleaves @
-        [SOME (Binding.name "more")];
-    fun declare_const (i, (SOME x, (acc, T))) thy =
-          (if is_base andalso i < n then
-            (*the base's predicate: the constant unqualified, its definition qualified (3.5)*)
-            thy
-            |> Sign.declare_const_global ((x, sT --> T), NoSyn)
-            |-> (fn c =>
-                  qualified #> Global_Theory.add_def (sealed_def x, Logic.mk_equals (c, acc))
-                  #>> pair c)
-           else thy |> qualified |> define_sealed (x, sT --> T) acc)
-          |>> SOME ||> Sign.restore_naming thy
-      | declare_const (_, (NONE, _)) thy = (NONE, thy);
+    (* the constructor, and an accessor constant for each leaf and for more, with their sealed
+      definitions; the constructor and the accessors of the anonymous leaves are hidden *)
+    val in_extension = Binding.qualify_name true ext_b;
+    val more = Free ("more", moreT);
+    val xs = map_index (fn (i, T) => Free ("x" ^ string_of_int i, T)) Ts;
+    val ((constructor, constructor_def), thy1) = thy1
+      |> qualified
+      |> define_sealed (hidden (in_extension "constructor"), (Ts @ [moreT]) ---> extT)
+          (fold_rev lambda (xs @ [more]) (abs $ mk_layer (xs @ [more])))
+      ||> Sign.restore_naming thy1;
+    val bindings =
+      map_index (fn (i, (x, _)) =>
+        if Binding.is_empty x then hidden (in_extension ("leaf" ^ string_of_int i)) else x)
+        bleaves @ [Binding.name "more"];
+    fun declare_const (i, (x, (proj, T))) thy =
+      (if is_base andalso i < n then
+        (*the base's predicate: the constant unqualified, its definition qualified (3.5)*)
+        thy
+        |> Sign.declare_const_global ((x, sT --> T), NoSyn)
+        |-> (fn c =>
+              qualified #> Global_Theory.add_def (sealed_def x, Logic.mk_equals (c, lambda r proj))
+              #>> pair c)
+       else thy |> qualified |> define_sealed (x, sT --> T) (lambda r proj))
+      ||> Sign.restore_naming thy;
     val (consts_defs, thy2) =
-      fold_map declare_const (map_index I (named ~~ (accs ~~ (Ts @ [moreT])))) thy1;
-    val defs = map_filter (Option.map snd) consts_defs;
-    val accs' = map2 (fn SOME (c, _) => K c | NONE => I) consts_defs accs;
+      fold_map declare_const
+        (map_index I (bindings ~~ (projs (n + 1) rep_r ~~ (Ts @ [moreT])))) thy1;
+    val (accs, defs) = split_list consts_defs;
+    val (leaf_accs, more_acc) = split_last accs;
+    (*the rules of the representation: they leave this function in no theorem's statement*)
+    val representation =
+      constructor_def :: defs @
+        map meta (abs_inverse :: Rep_inverse :: @{thms fst_conv snd_conv prod.collapse});
 
     (* the canonical term *)
     val up = (case parent of NONE => [] | SOME p => chain thy2 p);
-    val levels = up @ [(name, Ts)];
     val (xss, _) = fold_map (fn (_, Us) => fn i =>
-      (map_index (fn (j, U) => Free ("x" ^ string_of_int (i + j), U)) Us, i + length Us)) levels 0;
-    val more = Free ("more", moreT);
+      (map_index (fn (j, U) => Free ("x" ^ string_of_int (i + j), U)) Us, i + length Us))
+      (up @ [(name, Ts)]) 0;
     val up_layers = map (the_layer thy2 o #1) up;
-    val abss = map #abs up_layers @ [abs];
-    val whole = whole_of thy2 abss xss more;
+    val up_layer = try List.last up_layers;
+    val constructors = map #constructor up_layers @ [constructor];
+    val whole = whole_of thy2 constructors xss more;
+    fun prove xs' prop tac =
+      Goal.prove_sorry_global thy2 xs' [] (HOLogic.mk_Trueprop prop) tac;
 
-    (* accessor theorems *)
-    val up_layer = Option.map (fn (_, p) => the_layer thy2 (#owner (the_entry thy2 p))) parent;
+    (* what the accessors read of the canonical term *)
     val up_more_conv = the_list (Option.map #more_conv up_layer);
     val convs = map2 (fn acc => fn x =>
-        Goal.prove_sorry_global thy2 [] []
-          (HOLogic.mk_Trueprop (HOLogic.mk_eq (app thy2 acc whole, x)))
+        prove [] (HOLogic.mk_eq (app thy2 acc whole, x))
           (fn {context = ctxt, ...} =>
-            rewrite_goals_tac ctxt
-              (defs @ map meta (up_more_conv @ [abs_inverse] @ @{thms fst_conv snd_conv})) THEN
+            rewrite_goals_tac ctxt (representation @ map meta up_more_conv) THEN
             resolve_tac ctxt @{thms refl} 1))
-      accs' (List.last xss @ [more]);
+      accs (List.last xss @ [more]);
 
     (* equality: equal leaves along the chain and equal more give equal values *)
     val r' = Free ("r'", sT);
     val up_accs = maps (map #acc o #leaves) up_layers;
-    val prems =
-      map (fn acc => HOLogic.mk_Trueprop (HOLogic.mk_eq (app thy2 acc r, app thy2 acc r')))
-        (up_accs @ accs');
     val equality =
-      Goal.prove_sorry_global thy2 ["r", "r'"] prems (HOLogic.mk_Trueprop (HOLogic.mk_eq (r, r')))
+      Goal.prove_sorry_global thy2 ["r", "r'"]
+        (map (fn acc => mk_prop_eq (app thy2 acc r, app thy2 acc r')) (up_accs @ accs))
+        (mk_prop_eq (r, r'))
         (fn {context = ctxt, prems} =>
           let
             val (up_prems, own_prems) = chop (length up_accs) prems;
@@ -3106,58 +3267,77 @@ fun add_layer b args parent bleaves thy0 =
             EVERY (map (fn p => resolve_tac ctxt [p] 1) own_prems')
           end);
 
-    (* surjective: every value is the canonical term of its leaves and more *)
-    val applied = map (map (fn acc => app thy2 acc r)) (map (map #acc o #leaves) up_layers @
-      [#1 (split_last accs')]);
+    (* surjective: every value is the canonical term of what the accessors read of it *)
+    fun read_by accs' = map (fn acc => app thy2 acc r) accs';
+    (*the canonical term of what the accessors read of r, with the given more*)
+    val read_whole =
+      whole_of thy2 constructors
+        (map (read_by o map #acc o #leaves) up_layers @ [read_by leaf_accs]);
     val surjective =
-      Goal.prove_sorry_global thy2 ["r"] []
-        (HOLogic.mk_Trueprop
-          (HOLogic.mk_eq (r, whole_of thy2 abss applied (app thy2 (List.last accs') r))))
+      prove ["r"]
+        (HOLogic.mk_eq (r, read_whole (app thy2 more_acc r)))
         (fn {context = ctxt, ...} =>
           (case up_layer of
             NONE => all_tac
           | SOME {surjective = up_surj, ...} => resolve_tac ctxt [@{thm trans} OF [up_surj]] 1) THEN
-          rewrite_goals_tac ctxt (defs @ map meta ([Rep_inverse] @ @{thms prod.collapse})) THEN
-          resolve_tac ctxt @{thms refl} 1);
+          rewrite_goals_tac ctxt representation THEN resolve_tac ctxt @{thms refl} 1);
+
+    (* split: the more of the layer below agrees where the leaves and more of this layer do *)
+    val split =
+      up_more |> Option.map (fn m =>
+        let
+          val X = Free ("X", sT) and Y = Free ("Y", sT);
+          fun same f = HOLogic.mk_eq (app thy2 f X, app thy2 f Y);
+        in
+          prove ["X", "Y"] (HOLogic.mk_eq (same m, foldr1 HOLogic.mk_conj (map same accs)))
+            (fn {context = ctxt, ...} =>
+              rewrite_goals_tac ctxt (meta (Rep_inject RS @{thm sym}) :: defs) THEN
+              simp_tac
+                (put_simpset HOL_basic_ss ctxt
+                  |> Simplifier.add_simps @{thms prod_eq_iff conj_assoc}) 1 THEN
+              TRY (resolve_tac ctxt @{thms refl} 1))
+        end);
 
     (* truncate: the more slot of this layer replaced by () *)
     val truncT = sT --> Term.typ_subst_atomic [(moreT, HOLogic.unitT)] sT;
+    val truncated = read_whole HOLogic.unit;
     val ((trunc, trunc_def), thy3) = thy2
       |> qualified
-      |> define_sealed (Binding.name "truncate", truncT)
-          (lambda r (whole_of thy2 abss applied HOLogic.unit))
+      |> define_sealed (Binding.name "truncate", truncT) (lambda r truncated)
       ||> Sign.restore_naming thy2;
+    fun prove3 xs' prop tac = Goal.prove_sorry_global thy3 xs' [] (HOLogic.mk_Trueprop prop) tac;
+    val trunc_eq =
+      prove3 ["r"] (HOLogic.mk_eq (trunc $ r, truncated)) (fn {context = ctxt, ...} =>
+        rewrite_goals_tac ctxt [trunc_def] THEN resolve_tac ctxt @{thms refl} 1);
     val trunc_conv =
-      Goal.prove_sorry_global thy3 [] []
-        (HOLogic.mk_Trueprop (HOLogic.mk_eq (trunc $ whole, whole_of thy3 abss xss HOLogic.unit)))
+      prove3 [] (HOLogic.mk_eq (trunc $ whole, whole_of thy3 constructors xss HOLogic.unit))
         (fn {context = ctxt, ...} =>
           rewrite_goals_tac ctxt
             (trunc_def :: map meta (maps (map #conv o #leaves) up_layers @ convs)) THEN
           resolve_tac ctxt @{thms refl} 1);
 
-    val leaves = map2 (fn ((T, acc), conv) => fn const_def =>
-        {name = Option.map (dest_Const_name o fst) const_def, typ = T, acc = acc, conv = conv})
-      (Ts ~~ #1 (split_last accs') ~~ #1 (split_last convs)) (#1 (split_last consts_defs));
+    val (leaf_convs, more_conv) = split_last convs;
+    val leaves = map2 (fn ((x, T), acc) => fn conv =>
+        {name = if Binding.is_empty x then NONE else SOME (dest_Const_name acc), typ = T,
+         acc = acc, conv = conv})
+      (bleaves ~~ leaf_accs) leaf_convs;
     val layer: layer =
-     {ext = ext_tyco, abs = abs, leaves = leaves, more_conv = List.last convs,
-      defs = defs, abs_inverse = abs_inverse, rep_inject = Rep_inject, equality = equality,
-      surjective = surjective,
-      truncate = trunc, truncate_def = trunc_def, truncate_conv = trunc_conv};
-
-    (* code generation: Abs is the constructor; the accessor theorems and that of truncate are
-      code equations *)
-    val code_eqns =
-      map_filter (fn (SOME _, conv) => SOME conv | _ => NONE) (named ~~ convs) @
-      (if forall is_some named then [] else [abs_inverse]) @ [trunc_conv];
+     {ext = ext_tyco, constructor = constructor, leaves = leaves, more_conv = more_conv,
+      equality = equality, surjective = surjective, split = split, truncate = trunc,
+      truncate_def = meta trunc_eq};
   in
     thy3
-    |> Code.declare_datatype_global [dest_Const abs]
-    |> Code.declare_default_eqns_global (map (rpair true) code_eqns)
+    (*code generation: the constructor of the layer; what the accessors read of a canonical term
+      and what truncate makes of one are code equations*)
+    |> Code.declare_datatype_global [dest_Const constructor]
+    |> Code.declare_default_eqns_global (map (rpair true) (convs @ [trunc_conv]))
     |> put_entry {name = name, args = args, parent = parent, owner = name, layer = SOME layer,
-        scheme = sT, more = List.last accs', views = []}
+        scheme = sT, more = more_acc, views = []}
     |> register_layer name
     |> not is_base ? add_laws name
   end;
+
+end;
 
 
 (* the base concept *)
@@ -3415,14 +3595,26 @@ fun declare {name = b, args, parent, items} thy0 =
       let
         val qname = Binding.name_of qualifier;
         val given = maps (read_entry idx qname view_consts) entries;
-        (*the slots of the view: the leaves of its parent, and its more unless that is ()*)
-        val slots_R = node_leaves thy (p_R, more_R);
-        val values =
+        (*the leaves of the concept that read_leaf can read, with their reads*)
+        val held =
+          major_chain thy p_C |> maps (fn (_, d) =>
+            maps (map_filter (fn Leaf i => SOME i | Given _ => NONE) o #slots)
+              (#views (the_entry thy d)));
+        val candidates =
+          map_index I leaves_C |> map_filter (fn (i, {name, ...}) =>
+            if is_some name orelse member (op =) held i
+            then SOME (read_leaf thy p_C i S, Leaf i) else NONE);
+        (*the slots of the view, one for each leaf of its parent and for its more unless that is
+          (): the leaf of the concept that it reads, or given*)
+        val slots =
           map_index (fn (j, _) =>
             (case AList.lookup (op =) given j of
-              SOME t => t
-            | NONE => app thy (#acc (nth leaves_C (the (AList.lookup (op =) anon j)))) S))
-          slots_R;
+              SOME t => the_default (Given (name, t)) (AList.lookup (op aconv) candidates t)
+            | NONE => Leaf (the (AList.lookup (op =) anon j))))
+          (node_leaves thy (p_R, more_R));
+        (*a leaf of the concept is read by its accessor, an anonymous one too*)
+        val values =
+          map (fn Leaf i => app thy (#acc (nth leaves_C i)) S | Given (_, t) => t) slots;
         val (leaf_values, more_value) =
           if more_R = HOLogic.unitT then (values, HOLogic.unit) else split_last values;
         val value = mk_value thy p_R \<^Const>\<open>True\<close> leaf_values more_value;
@@ -3432,25 +3624,9 @@ fun declare {name = b, args, parent, items} thy0 =
           ||> Sign.restore_naming thy;
         val (concept_eq, code_eq) =
           prove_definitional thy' def [s_name] (c $ S) \<^Const>\<open>True\<close> value;
-
-        (*the leaves of the concept that read_leaf can read, with their reads*)
-        val held =
-          major_chain thy' p_C |> maps (fn (_, d) =>
-            maps (map_filter (fn Leaf i => SOME i | Given _ => NONE) o #slots)
-              (#views (the_entry thy' d)));
-        val candidates =
-          map_index I leaves_C |> map_filter (fn (i, {name, ...}) =>
-            if is_some name orelse member (op =) held i
-            then SOME (read_leaf thy' p_C i S, Leaf i) else NONE);
-        (*each leaf of the parent: the leaf of the concept it reads, or given*)
-        fun slot_of j =
-          (case AList.lookup (op =) given j of
-            SOME t => the_default (Given (name, t)) (AList.lookup (op aconv) candidates t)
-          | NONE => Leaf (the (AList.lookup (op =) anon j)));
         val view: view_entry =
          {name = dest_Const_name c, qualifier = qname, const = c, parent = p_R, more = more_R,
-          slots = map_index (slot_of o #1) slots_R, S = S, values = values, def = def,
-          concept_eq = concept_eq};
+          slots = slots, def = meta code_eq, concept_eq = concept_eq};
       in
         (view_consts @ [c],
           thy'
@@ -3798,25 +3974,32 @@ fun define_instance ctxt
         val lhs = list_comb (c, params);
         val (concept_eq, code_eq) =
           prove_definitional thy1 def param_names lhs constraint value;
-        val base_more = app thy1 (#more (the_entry thy1 (base_name thy1)));
-        val source =
-          sourced |> Option.map (fn (kind, layer, t) =>
-            let val truncate = app thy1 (#truncate (the_layer thy1 layer)) in
-              {kind = kind, layer = layer, term = t,
-               fields =
-                prove_unfold thy1 [def] param_names (base_more (truncate lhs))
-                  (base_more (truncate t)),
-               forward = NONE}
-            end);
-        val instance: instance_entry =
+        fun entry source : instance_entry =
          {name = cname, const = c, concept = p_D, params = params, values = values, more = more,
-          wholes = wholes, premises = premises, def = def, concept_eq = concept_eq,
+          wholes = wholes, premises = premises, def = meta code_eq, concept_eq = concept_eq,
           family = family, source = source, implications = Inttab.empty,
           agreed =
             agreed |> map (fn th =>
               Thm.transfer thy1 th
               |> Thm.implies_intr (Thm.global_cterm_of thy1 (Logic.mk_equals (lhs, lhs)))
               |> Drule.export_without_context)};
+        (*the instance is entered first: that it agrees with its source is read of it*)
+        val thy2 = put_instance (entry NONE) thy1;
+        val base_more = app thy2 (#more (the_entry thy2 (base_name thy2)));
+        val source =
+          sourced |> Option.map (fn (kind, layer, t) =>
+            let val truncate = app thy2 (#truncate (the_layer thy2 layer)) in
+              {kind = kind, layer = layer, term = t,
+               fields =
+                Goal.prove_sorry_global thy2 param_names []
+                  (mk_prop_eq (base_more (truncate lhs), base_more (truncate t)))
+                  (fn {context = ctxt', ...} =>
+                    (case base_more_equation ctxt' (truncate lhs) (truncate t) of
+                      SOME th => resolve_tac ctxt' [th] 1
+                    | NONE => no_tac)),
+               forward = NONE}
+            end);
+        val instance = entry source;
         (*this member provides the layers of its type that nothing provides yet*)
         val provider: provider =
          {member = cname, shown = xname, theory = Context.theory_base_name thy,
@@ -3838,7 +4021,7 @@ fun define_instance ctxt
           | _ => I);
       in
         (instance_of instance,
-          thy1
+          thy2
           (*a global instance without parameters is computable*)
           |> null params ? Code.declare_default_eqns_global [(code_eq, true)]
           |> put_instance instance
