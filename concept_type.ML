@@ -906,17 +906,27 @@ val in_selector_simp_config =
 fun in_selector_simp ctxt = Config.get ctxt in_selector_simp_config;
 
 (*the option concept_fact_trace, of the search for concept facts: declared here, for what this
-  layer is to trace of its own work in that search*)
+  layer traces of its own work*)
 val trace = Attrib.setup_config_bool \<^binding>\<open>concept_fact_trace\<close> (K false);
 
 (*the simplifier steps that one unit of work of this package may take: a call of an entry of
   the selector Simpset, a filling of the cache, an attempt at a truncate congruence rule, a
-  comparison of two values.  A unit that needs more gives NONE from bounded;
+  comparison of two values.  A unit that needs more gives NONE from bounded, and under
+  concept_fact_trace says so, with what it was simplifying;
   each unit says what it then gives.  Nested units count on the bounds around them too; with
   one bound everywhere a nested unit never gives NONE: the outermost unit stops*)
 val step_bound = 1000;
 
-fun bounded f = Simp_Steps.limited step_bound f;
+fun bounded simplifying f ctxt =
+  (case Simp_Steps.limited step_bound f ctxt of
+    NONE =>
+      (if Config.get ctxt trace then
+        tracing ("the selector Simpset stopped: it reached its bound of " ^
+          string_of_int step_bound ^ " simplifier steps.\n  simplifying: " ^
+          Syntax.string_of_term ctxt (simplifying ()))
+       else ();
+       NONE)
+  | result => result);
 
 (*the context for unfolding one given definition: no bound counts these steps.  Such rewriting
   always ends, and runs neither the selector Simpset nor any rule or assumption of a user; so a
@@ -1000,7 +1010,8 @@ fun may_rewrite ctxt t =
 
 (*ct rewritten by the selector Simpset; none where the steps do not suffice*)
 fun selector_rewrite ctxt ct =
-  bounded (fn ctxt' => Simplifier.rewrite (put_selector_simpset ctxt') ct) ctxt;
+  bounded (fn () => Thm.term_of ct)
+    (fn ctxt' => Simplifier.rewrite (put_selector_simpset ctxt') ct) ctxt;
 
 (*the same, ct unchanged where the steps do not suffice*)
 fun selector_conv ctxt ct = the_default (Thm.reflexive ct) (selector_rewrite ctxt ct);
@@ -1010,7 +1021,7 @@ fun selector_conv ctxt ct = the_default (Thm.reflexive ct) (selector_rewrite ctx
   the steps do not suffice*)
 fun selector_simp_tac ctxt rules i st =
   (case
-    bounded (fn ctxt' =>
+    bounded (fn () => Logic.get_goal (Thm.prop_of st) i) (fn ctxt' =>
       SINGLE (asm_full_simp_tac (fold Simplifier.add_simp rules (put_selector_simpset ctxt')) i)
         st) ctxt of
     SOME (SOME st') => Seq.single st'
@@ -1022,7 +1033,7 @@ fun selector_simp_tac ctxt rules i st =
   premises, where it solves the conditions of the equations; the mksimps handlers still take
   it apart.  None where the steps do not suffice*)
 fun selector_simplify ctxt th =
-  bounded (fn ctxt' =>
+  bounded (fn () => Thm.prop_of th) (fn ctxt' =>
     Simplifier.asm_lr_simplify
       (put_selector_simpset ctxt'
         |> Simplifier.set_mksimps_context (fn prem => fn ctxt'' =>
@@ -1366,7 +1377,7 @@ fun cached ctxt key prove =
         fun live (entry as (_, (_, r))) = Unsynchronized.weak_active r ? Termtab.update entry;
       in if n < 255 then (n + 1, tab') else (0, Termtab.fold live tab' Termtab.empty) end;
     fun proved () =
-      bounded (fn ctxt' =>
+      bounded (K key) (fn ctxt' =>
         let
           val ctxts =
             map (Simp_Steps.inherit ctxt' o Proof_Context.init_global)
@@ -1379,8 +1390,8 @@ fun cached ctxt key prove =
   in
     (case peek (#2 (Synchronized.value cache)) of
       SOME (steps, th) =>
-        if Context.subthy_id (Thm.theory_id th, Context.theory_id thy)
-        then bounded (fn ctxt' => (Simp_Steps.charge steps ctxt'; Thm.transfer thy th)) ctxt
+        if Context.subthy_id (Thm.theory_id th, Context.theory_id thy) then
+          bounded (K key) (fn ctxt' => (Simp_Steps.charge steps ctxt'; Thm.transfer thy th)) ctxt
         else proved ()
     | NONE => proved ())
   end;
@@ -1489,7 +1500,9 @@ datatype comparison = Agree of thm | Differ of term * term | Undecided;
 fun compare_values ctxt t u =
   if t aconv u then Agree (Thm.reflexive (Thm.cterm_of ctxt t))
   else
-    (case bounded (fn ctxt' => convert_both (value_conv ctxt') ctxt' (t, u)) ctxt of
+    (case
+      bounded (fn () => HOLogic.mk_eq (t, u))
+        (fn ctxt' => convert_both (value_conv ctxt') ctxt' (t, u)) ctxt of
       SOME sides =>
         (case join_converted sides of
           SOME th => Agree th
@@ -1895,7 +1908,9 @@ fun prove_cong_meta ctxt own def lhs rhs =
 
 (*one attempt, a bounded unit: none where the two sides differ or the steps do not suffice*)
 fun prove_cong ctxt own def lhs rhs =
-  Option.join (bounded (fn ctxt' => prove_cong_meta ctxt' own def lhs rhs) ctxt)
+  bounded (fn () => HOLogic.mk_eq (lhs, rhs))
+    (fn ctxt' => prove_cong_meta ctxt' own def lhs rhs) ctxt
+  |> Option.join
   |> Option.map (fn th => th RS @{thm meta_eq_to_obj_eq});
 
 (*a constant of this package: its definition is unfolded down to the leaves*)
