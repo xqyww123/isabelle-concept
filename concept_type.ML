@@ -37,6 +37,11 @@ sig
   val the_info: theory -> string -> info
   val get_instance: theory -> string -> instance option
   val equality: theory -> string -> thm option
+  val fix_schematics: Proof.context -> term list ->
+   {context: Proof.context, fix: term -> term, freeze: thm -> thm, thaw: term -> term,
+    thawT: typ -> typ, thaw_thm: thm -> thm}
+  val fixing: Proof.context -> term list ->
+    (Proof.context -> (thm -> thm) -> (term -> term) -> thm) -> thm
   val truncate_eq: Proof.context -> {concept: string, s: term, t: term} ->
     {env: Type.tyenv * Envir.tenv, eq: thm lazy, extra: term option, reached: bool} option
   val add_implication: string -> thm -> theory -> theory
@@ -3005,6 +3010,34 @@ fun prove_truncate_eq ctxt inst known (top: level) =
 
 (* truncate_eq *)
 
+(*A context that fixes the schematic variables of the terms, with the ways there, for terms and
+  theorems, and back, for terms, types and theorems.  The terms are declared first, so that no
+  name that the context invents is one of theirs*)
+fun fix_schematics ctxt ts =
+  let
+    val (inst as (instT, insts), ctxt') =
+      Variable.import_inst true ts (fold Variable.declare_term ts ctxt);
+    val (revertT, revert) = Variable.import_inst_revert inst;
+  in
+    {context = ctxt',
+     fix = Term_Subst.instantiate inst,
+     freeze =
+       Thm.instantiate
+        (TVars.map (K (Thm.ctyp_of ctxt')) instT, Vars.map (K (Thm.cterm_of ctxt')) insts),
+     thaw = Term_Subst.instantiate_frees (revertT, revert),
+     thawT = Term_Subst.instantiateT_frees revertT,
+     thaw_thm =
+       Thm.instantiate_frees
+        (TFrees.map (K (Thm.ctyp_of ctxt)) revertT, Frees.map (K (Thm.cterm_of ctxt)) revert)}
+  end;
+
+(*f in a context that fixes the schematic variables of the terms; it gets this fixing for
+  theorems and for terms.  Its theorem comes back with these variables schematic again, so
+  nothing that f does can rename them*)
+fun fixing ctxt ts f =
+  let val {context, fix, freeze, thaw_thm, ...} = fix_schematics ctxt ts
+  in thaw_thm (f context freeze fix) end;
+
 (*for terms t without schematic variables*)
 fun truncate_eq_fixed ctxt {concept, s, t} =
   let
@@ -3061,16 +3094,10 @@ fun truncate_eq ctxt (arg as {concept, s, t}) =
   if Term.maxidx_of_term t = ~1 then truncate_eq_fixed ctxt arg
   else
     let
-      val (inst, ctxt') = Variable.import_inst true [t] ctxt;
-      (*back to the variables of t*)
-      val (revertT, revert) = Variable.import_inst_revert inst;
-      val thaw = Term_Subst.instantiate_frees (revertT, revert);
-      val thawT = Term_Subst.instantiateT_frees revertT;
-      val thaw_thm =
-        Thm.instantiate_frees
-          (TFrees.map (K (Thm.ctyp_of ctxt)) revertT, Frees.map (K (Thm.cterm_of ctxt)) revert);
+      val {context, fix, thaw, thawT, thaw_thm, ...} =
+        fix_schematics (Variable.declare_term s ctxt) [t];
     in
-      truncate_eq_fixed ctxt' {concept = concept, s = s, t = Term_Subst.instantiate inst t}
+      truncate_eq_fixed context {concept = concept, s = s, t = fix t}
       |> Option.map (fn {env = (tyenv, tenv), eq, extra, reached} =>
         {env =
           (Vartab.map (K (apsnd thawT)) tyenv,

@@ -22,6 +22,8 @@ sig
   val the_concept: theory -> string -> concept
   val entailment: theory -> string -> string -> entailment option
   val ancestors: theory -> string -> (string * entailment) list
+  val holds: string -> term -> term
+  val truncation_equation: Proof.context -> string -> term -> thm option
   type instance_facts = {destructions: (string * thm) list, of_concept: thm}
   val add_instance_facts: string -> instance_facts -> theory -> theory
   val instance_facts: theory -> string -> instance_facts option
@@ -343,6 +345,14 @@ fun instance_facts thy c =
 (*the predicate of a concept is the constant of the concept's name; the base's is its selector*)
 fun holds name t = Const (name, fastype_of t --> \<^Type>\<open>bool\<close>) $ t;
 
+(*C (P.truncate u) = C u for the predicate of the name c on t = P.truncate u, where the selector
+  simprocs give it without premises: only then does a truncation directly below C go.  On a
+  predicate they give this equation or none; a truncate congruence rule of C with other premises
+  gives it with those.  No schematic variables*)
+fun truncation_equation ctxt c t =
+  Concept_Type.selector_equation ctxt (holds c t)
+  |> Option.mapPartial (Option.filter (fn eq => Thm.nprems_of eq = 0));
+
 (*the n conjuncts of a right-nested conjunction*)
 fun conjuncts 1 th = [th]
   | conjuncts n th = (th RS @{thm conjunct1}) :: conjuncts (n - 1) (th RS @{thm conjunct2});
@@ -446,17 +456,10 @@ fun define b S major (views: (string * string * term) list)
     (*a parent holding of S itself is asked of S truncated to the parent's type, where its
       predicate ignores the truncation: the premise, and the conjunct from the premise*)
     fun on_structure P =
-      let
-        val t = Concept_Type.mk_truncate thy2 (#owner (Concept_Type.the_info thy2 P)) S;
-        val plain = (HOLogic.mk_Trueprop (holds P S), I);
-      in
-        (case Concept_Type.selector_equation ctxt2 (holds P t) of
-          SOME eq =>
-            if Thm.nprems_of eq = 0 andalso
-              #2 (HOLogic.dest_eq (HOLogic.dest_Trueprop (Thm.concl_of eq))) aconv holds P S
-            then (HOLogic.mk_Trueprop (holds P t), fn th => @{thm iffD1} OF [eq, th])
-            else plain
-        | NONE => plain)
+      let val t = Concept_Type.mk_truncate thy2 (#owner (Concept_Type.the_info thy2 P)) S in
+        (case truncation_equation ctxt2 P t of
+          SOME eq => (HOLogic.mk_Trueprop (holds P t), fn th => @{thm iffD1} OF [eq, th])
+        | NONE => (HOLogic.mk_Trueprop (holds P S), I))
       end;
     val premises =
       on_structure major ::
