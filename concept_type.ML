@@ -59,6 +59,7 @@ sig
     cong_rule option
   val in_selector_simp: Proof.context -> bool
   val trace: bool Config.T
+  val restoring: (unit -> exn option -> unit) -> Proof.context -> Proof.context
   val selector_rewrite: Proof.context -> cterm -> thm option
   val selector_conv: Proof.context -> conv
   val selector_simp_tac: Proof.context -> thm list -> int -> tactic
@@ -922,16 +923,37 @@ val trace = Attrib.setup_config_bool \<^binding>\<open>concept_fact_trace\<close
   one bound everywhere a nested unit never gives NONE: the outermost unit stops*)
 val step_bound = 1000;
 
+(*State outside the units that work inside a unit changes.  It is put back where a unit does
+  not give its result, so that such a unit leaves nothing behind: save is called before a unit;
+  what it gives is called where the unit reaches its bound, with NONE, and where an exception
+  ends it, with that exception*)
+structure Restoring = Proof_Data
+(
+  type T = (unit -> exn option -> unit) list;
+  fun init _ = [];
+);
+
+fun restoring save = Restoring.map (cons save);
+
 fun bounded simplifying f ctxt =
-  (case Simp_Steps.limited step_bound f ctxt of
-    NONE =>
-      (if Config.get ctxt trace then
-        tracing ("the selector Simpset stopped: it reached its bound of " ^
-          string_of_int step_bound ^ " simplifier steps.\n  simplifying: " ^
-          Syntax.string_of_term ctxt (simplifying ()))
-       else ();
-       NONE)
-  | result => result);
+  let
+    val saved = map (fn save => save ()) (Restoring.get ctxt);
+    fun restore ending = List.app (fn put_back => put_back ending) saved;
+  in
+    (case
+      \<^try>\<open>Simp_Steps.limited step_bound f ctxt
+        catch exn => (restore (SOME exn); Exn.reraise exn)\<close>
+     of
+      NONE =>
+        (restore NONE;
+         if Config.get ctxt trace then
+          tracing ("the selector Simpset stopped: it reached its bound of " ^
+            string_of_int step_bound ^ " simplifier steps.\n  simplifying: " ^
+            Syntax.string_of_term ctxt (simplifying ()))
+         else ();
+         NONE)
+    | result => result)
+  end;
 
 (*the context for unfolding one given definition: no bound counts these steps.  Such rewriting
   always ends, and runs neither the selector Simpset nor any rule or assumption of a user; so a
