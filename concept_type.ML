@@ -956,12 +956,6 @@ fun bounded simplifying f ctxt =
     | result => result)
   end;
 
-(*the context for unfolding one given definition: no bound counts these steps.  Such rewriting
-  always ends, and runs neither the selector Simpset nor any rule or assumption of a user; so a
-  unit that never ends still takes ever more counted steps*)
-fun uncounted ctxt =
-  Simp_Steps.inherit (Proof_Context.init_global (Proof_Context.theory_of ctxt)) ctxt;
-
 (*only here is the selector Simpset put on a context: map_selector_simpset does it to change it,
   the four entries to run it, each within a bound.  A procedure that the selector Simpset calls
   gets a context with the counters of the entry*)
@@ -1927,9 +1921,11 @@ fun rule_at context (c, i) n =
   |> Option.mapPartial
     (Option.filter (fn rule => rule_arity (Context.theory_of context) c rule = n));
 
-(*a term rewritten: the definition def unfolded, then the selector Simpset; modulo eta*)
+(*a term rewritten: the definition def unfolded where its constant stands outermost, by the
+  equation itself and no simplifier; then the selector Simpset, which also reduces what an
+  equation with fewer arguments on its left leaves; modulo eta*)
 fun cong_conv ctxt def =
-  Raw_Simplifier.rewrite_wrt (uncounted ctxt) false [def] then_conv
+  Conv.top_sweep_rewrs_conv [def] ctxt then_conv
   selector_conv ctxt then_conv Thm.eta_conversion;
 
 (*lhs == rhs, for terms that a constant makes of a structure and of its truncation: by its
