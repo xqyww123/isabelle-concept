@@ -78,6 +78,7 @@ sig
     items: item list} -> theory -> info * theory
   val mk_truncate: theory -> string -> term -> term
   val dest_truncation: theory -> term -> (string * term) option
+  val dest_view: theory -> term -> term option
   val extra_type_variables: string -> (string * sort) list -> 'a
   val header_context: theory -> string ->
     {context: Proof.context, S: term, substitution: (string * term) list}
@@ -1109,6 +1110,10 @@ fun dest_head thy w =
 fun dest_truncation thy w =
   (case dest_head thy w of SOME (Truncate_Head P, _, [u]) => SOME (P, u) | _ => NONE);
 
+(*s of v s for a view v*)
+fun dest_view thy w =
+  (case dest_head thy w of SOME (View_Head _, _, [s]) => SOME s | _ => NONE);
+
 (*a meta equation, with premises or without, instantiated so that its left side is ct*)
 fun at_cterm ct th =
   let
@@ -2124,7 +2129,7 @@ fun whole_equation ctxt agreed x y =
   let
     val thy = Proof_Context.theory_of ctxt;
     (*x, and the structures under its views down to the instance*)
-    fun under u = u :: (case dest_head thy u of SOME (View_Head _, _, [w]) => under w | _ => []);
+    fun under u = u :: (case dest_view thy u of SOME w => under w | NONE => []);
     val on_the_way = member (op aconv) (under x);
     (*t = u for what an accessor makes of x and of y: t read down to the value that the instance
       stores; u as the clause read it, an anonymous leaf through its view; they are one term, or
