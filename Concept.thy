@@ -1,5 +1,5 @@
 theory Concept
-  imports Main
+  imports Main Performant_Isabelle_ML.Performant_Isabelle_ML
   keywords "concept" :: thy_decl_block
 begin
 
