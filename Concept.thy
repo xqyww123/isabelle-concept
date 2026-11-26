@@ -9,5 +9,8 @@ ML_file \<open>concept_type.ML\<close>
 setup \<open>Concept_Type.declare_base\<close>
 
 ML_file \<open>concept_package.ML\<close>
+ML_file \<open>concept_intro_table.ML\<close>
+ML_file \<open>concept_search.ML\<close>
+ML_file \<open>concept_fact.ML\<close>
 
 end
