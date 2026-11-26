@@ -2605,7 +2605,7 @@ fun candidate ctxt t =
   in
     (case try (Sledgehammer_Util.thms_of_name ctxt) name of
       SOME [th] =>
-        SOME {name = name, prop = Thm.prop_of th,
+        SOME {name = K name, thm = Lazy.value th, prop = Thm.prop_of th,
           stature = (ATP_Problem_Generate.Global, ATP_Problem_Generate.Simp)}
     | _ => NONE)
   end;
