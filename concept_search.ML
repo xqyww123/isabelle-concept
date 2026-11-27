@@ -38,15 +38,16 @@ sig
       solutions: {rule: 'r, premises: (('g, 'r, 's) derivation, 's) premise list} list}
   type ('g, 'r, 's) solution =
    {rule: 'r, premises: (('g, 'r, 's) derivation, 's) premise list}
-  type ('g, 'r, 's) situation =
-   {dist: int, steps: int, under_way: ('g * (int * int)) list,
-    unconditional: int -> ('g, 'r, 's) solution list option}
+  type 'g situation =
+   {dist: int, steps: int, under_way: ('g * (int * int)) list}
   exception STOP
   exception WAIT of int * int
+  exception ASIDE
   type ('g, 'w, 'r, 'c, 's) problem =
-   {key: ('g, 'r, 's) situation -> 'g -> int, steps: 'g -> ('g, 'r, 'c) step list,
-    user_rule: unit -> unit, simplify: ('g, 'r, 's) situation -> 'c -> 's,
-    as_written: 'c -> 's, reading: ('g, 'w, 's) reading}
+   {key: 'g situation -> 'g -> int, steps: 'g -> ('g, 'r, 'c) step list,
+    user_rule: unit -> unit, solved: 'g -> (unit -> ('g, 'r, 's) solution list) -> unit,
+    simplify: 'g situation -> 'c -> 's, as_written: 'c -> 's,
+    reading: ('g, 'w, 's) reading}
   type limits =
    {max_search_distance: int, max_leaps: int, max_solution_number: int, unconditional: bool}
   datatype ('w, 's) literal =
@@ -96,25 +97,27 @@ type ('g, 'r, 's) solution = {rule: 'r, premises: (('g, 'r, 's) derivation, 's) 
 
 (*where the search stands when it asks for the key of a goal, or for a condition as it is given
   to the user.  dist, steps: of that goal, or of the goal whose solution leaves the condition;
-  under_way: the goals that are being solved on the branch of the goal, each with its entry;
-  unconditional: of a key, the solutions of its goal where it is solved without conditions*)
-type ('g, 'r, 's) situation =
- {dist: int, steps: int, under_way: ('g * (int * int)) list,
-  unconditional: int -> ('g, 'r, 's) solution list option};
+  under_way: the goals that are being solved on the branch of the goal, each with its entry*)
+type 'g situation =
+ {dist: int, steps: int, under_way: ('g * (int * int)) list};
 
 (*what the functions of a problem may raise.  STOP: the search ends with what it has; WAIT, from
-  key only: the goal cannot be told before the entry is solved, which is one of under_way*)
+  key only: the goal cannot be told before the entry is solved, which is one of under_way; ASIDE,
+  from key only: the goal cannot be told in this search, and the branch is left aside*)
 exception STOP;
 exception WAIT of int * int;
+exception ASIDE;
 
 (*key: goals of one key are one goal to the table; steps: in the order in which they are tried;
-  user_rule: called for every step of a user rule that a branch takes; simplify: of a condition
-  as a rule leaves it, the condition as it is given to the user; as_written: the same without
-  any work*)
+  user_rule: called for every step of a user rule that a branch takes; solved: called when a
+  goal is first solved without conditions, with what gives its solutions then and later;
+  simplify: of a condition as a rule leaves it, the condition as it is given to the user;
+  as_written: the same without any work*)
 type ('g, 'w, 'r, 'c, 's) problem =
- {key: ('g, 'r, 's) situation -> 'g -> int, steps: 'g -> ('g, 'r, 'c) step list,
-  user_rule: unit -> unit, simplify: ('g, 'r, 's) situation -> 'c -> 's,
-  as_written: 'c -> 's, reading: ('g, 'w, 's) reading};
+ {key: 'g situation -> 'g -> int, steps: 'g -> ('g, 'r, 'c) step list,
+  user_rule: unit -> unit, solved: 'g -> (unit -> ('g, 'r, 's) solution list) -> unit,
+  simplify: 'g situation -> 'c -> 's, as_written: 'c -> 's,
+  reading: ('g, 'w, 's) reading};
 
 (*max_search_distance: no step with premises on a goal whose distance and number of steps add
   up to it; max_leaps: no branch of this effective distance; max_solution_number: of the
@@ -293,7 +296,8 @@ type ('g, 'r, 'c, 's) entry =
 fun search_told (problem: ('g, 'w, 'r, 'c, 's) problem) (limits: limits)
     {goal = top, dist = top_dist, steps = top_steps} top_id =
   let
-    val {key = key_of, steps = steps_of, user_rule, simplify, as_written, reading} = problem;
+    val {key = key_of, steps = steps_of, user_rule, solved = on_solved, simplify, as_written,
+      reading} = problem;
     val {max_search_distance, max_leaps, max_solution_number, unconditional} = limits;
     val top_key = (top_id, top_dist);
 
@@ -398,12 +402,13 @@ fun search_told (problem: ('g, 'w, 'r, 'c, 's) problem) (limits: limits)
           premises |> map (fn Subgoal d => Subgoal d | Condition c => Condition (read c))});
     fun derivation read goal sols = Derivation {goal = goal, solutions = solutions read sols};
 
-    (*a goal solved without conditions has one solution, which leaves no condition to read*)
-    fun situation dist steps under_way : ('g, 'r, 's) situation =
-      {dist = dist, steps = steps, under_way = under_way,
-       unconditional = fn id =>
-        Inttab.lookup (! unconditional_keys) id |> Option.mapPartial (fn key =>
-          Option.map (solutions lenient) (build Keytab.empty (derivation lenient) key))};
+    fun situation dist steps under_way : 'g situation =
+      {dist = dist, steps = steps, under_way = under_way};
+
+    (*the solutions of an entry solved without conditions: one, which leaves no condition to
+      read*)
+    fun unconditional_solutions key () =
+      solutions lenient (the (build Keytab.empty (derivation lenient) key));
 
     (*a condition as it is given to the user: made when it is first read so*)
     fun strict ({raw, dist, steps, simplified}: ('c, 's) cell) =
@@ -505,8 +510,10 @@ fun search_told (problem: ('g, 'w, 'r, 'c, 's) problem) (limits: limits)
                 if own_eff = first_eff andalso first_eff > 0 then record key (hd frames) else ()
             | NONE =>
                (map_entry key (K {solved = SOME own, alts = [alt_of (hd frames)], waiting = []});
-                if own_ncond = 0 then
-                  Unsynchronized.change unconditional_keys (Inttab.default (#1 key, key))
+                if own_ncond = 0 andalso not (Inttab.defined (! unconditional_keys) (#1 key))
+                then
+                 (Unsynchronized.change unconditional_keys (Inttab.update (#1 key, key));
+                  on_solved goal (unconditional_solutions key))
                 else ();
                 List.app push (rev waiting);
                 run {eff = eff, ncond = ncond, nrules = nrules, items = items',
@@ -516,7 +523,7 @@ fun search_told (problem: ('g, 'w, 'r, 'c, 's) problem) (limits: limits)
           let val ancestors = under_way items' in
             (case
               SOME (key_of (situation dist steps ancestors) goal)
-                handle WAIT k => (wait k b; NONE)
+                handle WAIT k => (wait k b; NONE) | ASIDE => NONE
              of
               NONE => ()
             | SOME id =>
@@ -610,14 +617,16 @@ fun search_told (problem: ('g, 'w, 'r, 'c, 's) problem) (limits: limits)
         end)
   end;
 
-(*the top goal is told first; a search that this stops finds nothing*)
+(*the top goal is told first: a search that this stops, or whose top goal cannot be told,
+  finds nothing*)
 fun search (problem as {key, ...}: ('g, 'w, 'r, 'c, 's) problem) limits
     (start as {goal, dist, steps}) =
   (case
-    SOME (key {dist = dist, steps = steps, under_way = [], unconditional = K NONE} goal)
+    SOME (SOME (key {dist = dist, steps = steps, under_way = []} goal) handle ASIDE => NONE)
       handle STOP => NONE
    of
-    SOME id => search_told problem limits start id
+    SOME (SOME id) => search_told problem limits start id
+  | SOME NONE => Failed No_Plan
   | NONE => Failed User_Limit);
 
 end;
@@ -638,6 +647,7 @@ sig
   val search_unconditional: Proof.context -> term -> Concept_Intro_Table.derivation option
   val tidy: Proof.context -> Concept_Intro_Table.derivation ->
     {conditions: term list, proof: thm lazy}
+  val prove: Proof.context -> Concept_Intro_Table.derivation -> thm
 end;
 
 structure Concept_Search: CONCEPT_SEARCH =
@@ -661,27 +671,37 @@ val max_solution_number =
 (** goals and conditions **)
 
 (*what stands around the fact of a concept premise !!xs. H1 ==> ... ==> Hn ==> C t (4.1 of the
-  search plan): the parameters, as the free variables that the fact and the hypotheses have
-  for them, and the hypotheses.  Nothing stands around a fact where there are neither*)
-type wrapper = {params: (string * typ) list, hyps: term list};
+  search plan): the parameters, each the name of its binder with the free variable that the
+  fact and the hypotheses have for it, and the hypotheses.  Nothing stands around a fact where
+  there are neither*)
+type wrapper = {params: (string * (string * typ)) list, hyps: term list};
 
 val no_wrapper: wrapper = {params = [], hyps = []};
 
 fun same_wrapper ({params, hyps}: wrapper, {params = params', hyps = hyps'}: wrapper) =
   params = params' andalso eq_list (op aconv) (hyps, hyps');
 
-(*what a goal is once a search has taken it up.  outside: its solutions, where a search around
-  this one has solved it without conditions*)
-type told = {form: Intro.form, outside: Intro.solution list option};
+(*a goal of a search around that is under way: that search, its entry*)
+type mark = serial * (int * int);
 
-(*prop: C t as written; told: written when the goal is first told*)
-type goal = {prop: term, told: told option Unsynchronized.ref, wrapper: wrapper};
+(*What a search knows of a goal.  Untold: it has no form; the marks are the goals under way
+  around the search that have kept it so.  Told: its form, and outside: its theorem, where
+  another search of the call has proved it without conditions*)
+datatype told =
+    Untold of mark list
+  | Told of {form: Intro.form, outside: thm lazy option};
+
+(*prop: C t as written*)
+type goal = {prop: term, told: told Unsynchronized.ref, wrapper: wrapper};
 
 fun goal_of wrapper prop : goal =
-  {prop = prop, told = Unsynchronized.ref NONE, wrapper = wrapper};
+  {prop = prop, told = Unsynchronized.ref (Untold []), wrapper = wrapper};
 
 (*of a goal that has been told*)
-fun told_of ({told, ...}: goal) = the (! told);
+fun told_of ({told, ...}: goal) =
+  (case ! told of
+    Told told' => told'
+  | Untold _ => raise Fail "Concept_Search.told_of: a goal that is not told");
 val form_prop_of = Intro.form_prop o #form o told_of;
 
 (*a condition as a rule leaves it, with what the selector Simpset makes of it.  simp: cond ==
@@ -721,10 +741,11 @@ fun has_applicable_rule ctxt goal =
     SOME form => exists (is_some o match ctxt form) (Intro.entries_for ctxt form)
   | NONE => false);
 
-(*how a goal is solved: by a rule on it, or as a search around this one has solved it*)
+(*how a goal is solved: by a rule on it, or as another search of this call has proved it: by
+  the theorem of the form of the goal*)
 datatype rule =
     Rule of {entry: Intro.entry, matched: Intro.matched}
-  | Outside of Intro.solution list;
+  | Outside of thm lazy;
 
 (*the leap of a rule on a goal (4.2 of the search plan): none for a rule that the system marks
   as safe, where the structure of the goal gives that of the rule; else the concept distance,
@@ -738,28 +759,26 @@ fun leap ({safety, ...}: Intro.entry) ({concept_distance, how, ...}: Intro.match
   end;
 
 (*the wrapper of a concept premise and its fact: each !! gives a free variable of a new name,
-  wherever it stands among the ==>*)
+  wherever it stands among the ==>, kept with the name of the binder*)
 fun open_premise names prem =
   let
-    fun fresh x =
-      Unsynchronized.change_result names
-        (Name.variant (case Name.clean x of "" => "x" | x' => x'));
     fun strip (params, hyps) (\<^Const_>\<open>Pure.all T for \<open>Abs (x, _, body)\<close>\<close>) =
-          let val x' = fresh x
-          in strip ((x', T) :: params, hyps) (Term.subst_bound (Free (x', T), body)) end
+          let
+            val x0 = (case Name.clean x of "" => "x" | x0 => x0);
+            val x' = Unsynchronized.change_result names (Name.variant x0);
+          in strip ((x0, (x', T)) :: params, hyps) (Term.subst_bound (Free (x', T), body)) end
       | strip (params, hyps) (\<^Const_>\<open>Pure.imp for hyp body\<close>) =
           strip (params, hyp :: hyps) body
       | strip (params, hyps) fact = ({params = rev params, hyps = rev hyps}: wrapper, fact);
   in strip ([], []) prem end;
 
-(*The steps on a goal that has been told.  Solved outside: the one step that takes those
-  solutions.  Else the rules on the goal, of the concept C on the structure t: a concept premise
-  becomes a goal; it stays at the distance of the goal where it speaks of t itself, at C or at
-  a concept that C gives.  Every other premise is a condition*)
+(*The steps on a goal that has been told.  Proved by another search of the call: the one step
+  that takes that theorem.  Else the rules on the goal, of the concept C on the structure t: a
+  concept premise becomes a goal; it stays at the distance of the goal where it speaks of t
+  itself, at C or at a concept that C gives.  Every other premise is a condition*)
 fun steps ctxt names goal =
   (case told_of goal of
-    {outside = SOME solutions, ...} =>
-      [{rule = Outside solutions, premises = [], leap = 0, user = false}]
+    {outside = SOME th, ...} => [{rule = Outside th, premises = [], leap = 0, user = false}]
   | {form, ...} =>
       let
         val thy = Proof_Context.theory_of ctxt;
@@ -784,14 +803,14 @@ fun steps ctxt names goal =
 
 (** derivations **)
 
-fun solution_of ({rule = Outside solutions, premises = _}: (goal, rule, cond) Kernel.solution) =
-      solutions
+fun solution_of ({rule = Outside th, premises = _}: (goal, rule, cond) Kernel.solution) =
+      Intro.Solution {entry = NONE, rule = th, converted = false, premises = []}
   | solution_of {rule = Rule {entry, matched}, premises} =
-      [Intro.Solution
-        {entry = entry, rule = #rule matched,
-         converted =
+      Intro.Solution
+       {entry = SOME entry, rule = #rule matched,
+        converted =
           (case #how matched of Intro.As_Written => false | Intro.Converted _ => true),
-         premises = map premise_of premises}]
+        premises = map premise_of premises}
 and premise_of (Kernel.Subgoal (derivation as Kernel.Derivation {goal, ...})) =
       let val {params, hyps} = #wrapper goal
       in Intro.Concept {params = params, hyps = hyps, derivation = derivation_of derivation} end
@@ -799,145 +818,7 @@ and premise_of (Kernel.Subgoal (derivation as Kernel.Derivation {goal, ...})) =
 and derivation_of (Kernel.Derivation {goal, solutions}) =
   Intro.Goal
    {goal = #prop goal, form = Intro.form_equation (#form (told_of goal)),
-    solutions = maps solution_of solutions};
-
-
-
-(** searches around a search **)
-
-(*What a search tells the searches that the selector Simpset starts while it simplifies a goal
-  or a condition for this one (4.3 of the search plan).  dist, steps: of that goal, or of the
-  goal whose solution leaves the condition: a search inside goes on from them; unconditional: of
-  the form of a goal, the solutions where this search has solved it without conditions;
-  under_way: the forms of the goals that are being solved on the branch of the goal, each with
-  its entry*)
-type level =
- {id: serial, dist: int, steps: int, unconditional: term -> Intro.solution list option,
-  under_way: (term * (int * int)) list};
-
-(*used, limit: of the steps of user rules, in all the searches of one call from outside;
-  levels: of the searches around, the innermost first*)
-structure Around = Proof_Data
-(
-  type T = {used: int Unsynchronized.ref, limit: int, levels: level list} option;
-  fun init _ = NONE;
-);
-
-(*a search meets a goal that is under way in a search around it: that search, the entry.  The
-  search around takes it up again when the entry is solved*)
-exception GIVE_UP of serial * (int * int);
-
-
-
-(** the search **)
-
-(*max_leaps: no solution of this effective distance; unconditional: no rule that leaves a
-  condition.  The limit on user rules stops the outermost search: a search inside another one
-  passes the stop on*)
-fun run {max_leaps = leaps, unconditional} ctxt0 prop =
-  if is_none (Intro.dest_fact (Proof_Context.theory_of ctxt0) prop) then
-    Intro.Failed Intro.Not_Concept_Goal
-  else
-    let
-      val id = serial ();
-      val around = Around.get ctxt0;
-      val {used, limit, levels} =
-        (case around of
-          SOME around => around
-        | NONE =>
-            {used = Unsynchronized.ref 0, limit = Config.get ctxt0 user_limit, levels = []});
-      (*a unit of the selector Simpset that does not give its result has used no user rule,
-        unless a search that gives up ends it*)
-      val ctxt =
-        if is_some around then ctxt0
-        else
-          ctxt0 |> Concept_Type.restoring (fn () =>
-            let val n = ! used in fn SOME (GIVE_UP _) => () | _ => used := n end);
-      fun user_rule () =
-        if ! used >= limit then raise Kernel.STOP else Unsynchronized.inc used |> ignore;
-
-      (*the forms of the goals, numbered*)
-      val keys = Unsynchronized.ref (Termtab.empty: int Termtab.table);
-      fun number form_prop =
-        (case Termtab.lookup (! keys) form_prop of
-          SOME n => n
-        | NONE =>
-            let val n = Termtab.size (! keys)
-            in keys := Termtab.update (form_prop, n) (! keys); n end);
-
-      (*the context for what the selector Simpset does in a situation of this search*)
-      fun inside ({dist, steps, under_way, unconditional}: (goal, rule, cond) Kernel.situation) =
-        let
-          val level: level =
-            {id = id, dist = dist, steps = steps,
-             unconditional = fn form_prop =>
-              Termtab.lookup (! keys) form_prop |> Option.mapPartial unconditional
-              |> Option.map (maps solution_of),
-             under_way = map (apfst form_prop_of) under_way};
-        in Around.put (SOME {used = used, limit = limit, levels = level :: levels}) ctxt end;
-
-      (*A goal is told when it is first taken up.  A search that its form starts may give up on
-        a goal of this one: then the goal is told later.  This search gives up where the goal
-        is under way around it; no goal is both that and solved without conditions around it*)
-      fun tell situation ({prop, told, ...}: goal) =
-        (case ! told of
-          SOME told => told
-        | NONE =>
-            let
-              val form =
-                the (Intro.form_of_goal (inside situation) prop)
-                handle GIVE_UP (id', key) =>
-                  if id' = id then raise Kernel.WAIT key else raise GIVE_UP (id', key);
-              val form_prop = Intro.form_prop form;
-              val outside =
-                get_first (fn {unconditional, ...}: level => unconditional form_prop) levels;
-              val _ =
-                levels |> List.app (fn {id, under_way, ...} =>
-                  (case AList.lookup (op aconv) under_way form_prop of
-                    SOME key => raise GIVE_UP (id, key)
-                  | NONE => ()));
-              val result = {form = form, outside = outside};
-            in told := SOME result; result end);
-
-      val names = Unsynchronized.ref (Variable.names_of (Variable.declare_term prop ctxt));
-      val max_solutions = Config.get ctxt max_solution_number;
-      (*a search inside another one goes on from the goal that started it, one step further*)
-      val (start_dist, start_steps) =
-        (case levels of {dist, steps, ...} :: _ => (dist, steps + 1) | [] => (0, 0));
-    in
-      (case
-        Kernel.search
-         {key = number o Intro.form_prop o #form oo tell, steps = steps ctxt names,
-          user_rule = user_rule, simplify = simplify o inside, as_written = as_written,
-          reading = reading #wrapper}
-         {max_search_distance = Config.get ctxt max_search_distance, max_leaps = leaps,
-          max_solution_number = max_solutions, unconditional = unconditional}
-         {goal = goal_of no_wrapper prop, dist = start_dist, steps = start_steps}
-       of
-        Kernel.Found {derivation, distance, cut_short, ...} =>
-          if cut_short andalso is_some around then raise Kernel.STOP
-          else
-            Intro.Found
-             {value = derivation_of derivation,
-              (*nothing was to be collected at the distance 0, nor where one solution is
-                all that is wanted*)
-              cut_short = cut_short andalso distance > 0 andalso max_solutions > 1}
-      | Kernel.Failed Kernel.No_Plan => Intro.Failed Intro.No_Plan
-      | Kernel.Failed Kernel.User_Limit =>
-          if is_some around then raise Kernel.STOP else Intro.Failed Intro.User_Limit)
-    end;
-
-(*max_distance: the greatest effective distance of a solution; else that of the option
-  concept_fact_max_leaps, which is the least one not allowed*)
-fun search {max_distance} ctxt prop =
-  run
-   {max_leaps = (case max_distance of SOME n => n + 1 | NONE => Config.get ctxt max_leaps),
-    unconditional = false} ctxt prop;
-
-fun search_unconditional ctxt prop =
-  (case run {max_leaps = 1, unconditional = true} ctxt prop of
-    Intro.Found {value, ...} => SOME value
-  | Intro.Failed _ => NONE);
+    solutions = map solution_of solutions};
 
 
 
@@ -971,8 +852,7 @@ fun tidy ctxt derivation =
     (*a proposition under a wrapper; a literal as a formula, and as the proposition for the
       user: a condition as it is shown, a disjunction as one formula, a literal under a wrapper
       as its proposition under the wrapper*)
-    fun under ({params, hyps}: wrapper) prop =
-      Logic.list_implies (hyps, prop) |> fold_rev (Logic.all o Free) params;
+    val under = Intro.under;
     fun formula (Kernel.Cond c) = Intro.formula_of (shown c)
       | formula (Kernel.Or branches) = foldr1 HOLogic.mk_disj (map conjunction branches)
       | formula (Kernel.Under (w, lit)) = Intro.formula_of (under_formula w lit)
@@ -981,7 +861,8 @@ fun tidy ctxt derivation =
     fun prop (Kernel.Cond c) = shown c
       | prop (Kernel.Under (w, lit)) = under w (prop lit)
       | prop lit = HOLogic.mk_Trueprop (formula lit);
-    val conditions = map prop conj;
+    (*the same proposition once*)
+    val conditions = distinct (op aconv) (map prop conj);
 
     fun prove () =
       Concept_Type.fixing ctxt (Intro.derivation_terms derivation) (fn ctxt' => fn _ => fn fix =>
@@ -997,11 +878,11 @@ fun tidy ctxt derivation =
             (*A from !!xs. Hs ==> A at the parameters of the wrapper, its hypotheses assumed;
               and back*)
             fun instance ({params, hyps}: wrapper) th =
-              th |> fold (Thm.forall_elim o cert o Free) params
+              th |> fold (Thm.forall_elim o cert o Free o #2) params
               |> fold (fn hyp => fn th' => Thm.implies_elim th' (Thm.assume (cert hyp))) hyps;
             fun generalize ({params, hyps}: wrapper) th =
               th |> fold_rev (Thm.implies_intr o cert) hyps
-              |> fold_rev (Thm.forall_intr o cert o Free) params;
+              |> fold_rev (Thm.forall_intr o cert o Free o #2) params;
 
             (*the theorem of the formula of a literal, from that of its proposition*)
             fun fact (Kernel.Under (w, lit)) th =
@@ -1088,10 +969,248 @@ fun tidy ctxt derivation =
                       with_facts (maps (opened w) known) known (fn known' => goal known' d)
                       |> Option.map (Conv.fconv_rule formula_conv o generalize w));
           in
-            with_facts (conj ~~ map2 fact conj (map (Thm.assume o cert) conditions)) []
+            with_facts (map (fn lit => (lit, fact lit (Thm.assume (cert (prop lit))))) conj) []
               (fn known => goal known derivation)
             |> the |> fold_rev (Thm.implies_intr o cert) conditions
           end);
   in {conditions = conditions, proof = Lazy.lazy prove} end;
+
+(*R1 ==> ... ==> Rr ==> the goal of the derivation, as it was given to the search: the
+  conditions for the user, and nothing else.  The schematic variables, those of the goal and
+  those that the rules leave, are fixed while the theorem is made and come back as they were*)
+fun prove ctxt derivation =
+  let val tidied = Lazy.force (#proof (tidy ctxt derivation)) in
+    Concept_Type.fixing ctxt (Thm.prop_of tidied :: Intro.derivation_terms derivation)
+      (fn ctxt' => fn freeze => fn fix =>
+        let
+          val tidied' = freeze tidied;
+          val conditions = Thm.cprems_of tidied';
+        in
+          Drule.implies_elim_list tidied' (map Thm.assume conditions)
+          |> Intro.goal_thm ctxt' (Intro.map_derivation fix freeze derivation)
+          |> Drule.implies_intr_list conditions
+        end)
+  end;
+
+
+
+(** searches around a search **)
+
+(*What a search tells the searches that the selector Simpset starts while it simplifies a goal
+  or a condition for this one.  dist, steps: of that goal, or of the goal whose solution leaves
+  the condition: a search inside goes on from them; under_way: the forms of the goals that are
+  being solved on the branch of the goal, each with its entry*)
+type level = {id: serial, dist: int, steps: int, under_way: (term * (int * int)) list};
+
+(*a goal proved without conditions by a search of the call.  prems: the premises that the
+  simplifier had assumed where that search ran: the theorem holds where they are assumed;
+  by: that search; thm: of the form of the goal, made when it is first used*)
+type proved = {prems: term list, by: serial, thm: thm lazy};
+
+(*used, limit: of the steps of user rules, in all the searches of one call from outside;
+  proved: what they have proved without conditions, by the forms of the goals, the earliest
+  first; levels: of the searches around, the innermost first*)
+structure Around = Proof_Data
+(
+  type T =
+   {used: int Unsynchronized.ref, limit: int,
+    proved: proved list Termtab.table Unsynchronized.ref, levels: level list} option;
+  fun init _ = NONE;
+);
+
+(*A search ends without a solution free of conditions while goals of it cannot be told because
+  of goals under way around it: the marks of those.  Each search around takes its own marks,
+  where the branch waits for one of them and the goal is told again later, and passes the
+  others on*)
+exception GIVE_UP of mark list;
+
+
+
+(** the search **)
+
+(*the key of a goal: whether it is taken as proved by another search of the call, its form*)
+structure Keys = Table(type key = bool * term val ord = prod_ord bool_ord Term_Ord.fast_term_ord);
+
+(*max_leaps: no solution of this effective distance; unconditional: no rule that leaves a
+  condition.  The limit on user rules stops the outermost search: a search inside another one
+  passes the stop on*)
+fun run {max_leaps = leaps, unconditional} ctxt0 prop =
+  if is_none (Intro.dest_fact (Proof_Context.theory_of ctxt0) prop) then
+    Intro.Failed Intro.Not_Concept_Goal
+  else
+    let
+      val id = serial ();
+      val around = Around.get ctxt0;
+      val {used, limit, proved, levels} =
+        (case around of
+          SOME around => around
+        | NONE =>
+            {used = Unsynchronized.ref 0, limit = Config.get ctxt0 user_limit,
+             proved = Unsynchronized.ref Termtab.empty, levels = []});
+      (*the premises that the simplifier has assumed here*)
+      val local_prems =
+        Simplifier.prems_of ctxt0 |> map_filter (fn prem =>
+          let val t = Thm.prop_of prem
+          in if member (op aconv) (Thm.hyps_of prem) t then SOME t else NONE end);
+      (*The context of this search, also for the theorems that are made of it later: without
+        what the searches around tell, which holds only while they stand where they stood.  A
+        unit of the selector Simpset that does not give its result has used no user rule and
+        proved nothing, unless a search that gives up ends it*)
+      val ctxt =
+        Around.put NONE ctxt0
+        |> is_none around ? Concept_Type.restoring (fn () =>
+            let val (n, tab) = (! used, ! proved)
+            in fn SOME (GIVE_UP _) => () | _ => (used := n; proved := tab) end);
+      fun user_rule () =
+        if ! used >= limit then raise Kernel.STOP else Unsynchronized.inc used |> ignore;
+
+      (*the context for what the selector Simpset does in a situation of this search*)
+      fun inside ({dist, steps, under_way}: goal Kernel.situation) =
+        let
+          val level: level =
+            {id = id, dist = dist, steps = steps,
+             under_way = map (apfst form_prop_of) under_way};
+        in
+          ctxt |> Around.put
+            (SOME {used = used, limit = limit, proved = proved, levels = level :: levels})
+        end;
+
+      (*the goals that a give-up or a goal under way around this search has kept untold, each
+        once; a goal among them may have been told since*)
+      val untold = Unsynchronized.ref ([]: goal list);
+      fun set_marks (goal as {told, ...}: goal) marks =
+        (told := Untold marks;
+         Unsynchronized.change untold (insert (fn (g: goal, g': goal) => #told g = #told g') goal));
+      (*the marks of the goals that are still untold*)
+      fun outer_marks () =
+        ! untold
+        |> maps (fn {told, ...}: goal => (case ! told of Untold marks => marks | Told _ => []))
+        |> distinct (op =);
+
+      (*A goal is told when a branch takes it up, once.
+        - A search that its form starts gives up.  Where goals of this search are among its
+          marks, the branch waits for the innermost of them, and the goal is told again
+          later; else the goal cannot be told here.
+        - Another search of the call has proved the form where no more was assumed than here:
+          that theorem is taken.
+        - Else, where the form is under way around this search, the goal cannot be told here*)
+      fun tell (situation: goal Kernel.situation) (goal as {prop, told, ...}: goal) =
+        (case ! told of
+          Told told' => told'
+        | Untold _ =>
+            let
+              val form =
+                the (Intro.form_of_goal (inside situation) prop)
+                handle GIVE_UP marks =>
+                  let val (own, outer) = List.partition (fn (id', _) => id' = id) marks in
+                    set_marks goal outer;
+                    (case
+                      find_first (fn (_, key) => member (op =) (map #2 own) key)
+                        (#under_way situation)
+                     of
+                      SOME (_, key) => raise Kernel.WAIT key
+                    | NONE => raise Kernel.ASIDE)
+                  end;
+              val form_prop = Intro.form_prop form;
+              val outside =
+                Termtab.lookup_list (! proved) form_prop
+                |> get_first (fn {prems, by, thm}: proved =>
+                  if by <> id andalso subset (op aconv) (prems, local_prems) then SOME thm
+                  else NONE);
+              val _ =
+                if is_some outside then ()
+                else
+                  (case
+                    levels |> maps (fn {id, under_way, ...}: level =>
+                      (case AList.lookup (op aconv) under_way form_prop of
+                        SOME key => [(id, key)]
+                      | NONE => []))
+                   of
+                    [] => ()
+                  | marks => (set_marks goal marks; raise Kernel.ASIDE));
+              val result = {form = form, outside = outside};
+            in told := Told result; result end);
+
+      (*the keys, numbered; a goal taken as proved is another goal than one of the same form
+        that is not*)
+      val keys = Unsynchronized.ref (Keys.empty: int Keys.table);
+      fun key situation goal =
+        let
+          val {form, outside} = tell situation goal;
+          val k = (is_some outside, Intro.form_prop form);
+        in
+          (case Keys.lookup (! keys) k of
+            SOME n => n
+          | NONE =>
+              let val n = Keys.size (! keys)
+              in keys := Keys.update (k, n) (! keys); n end)
+        end;
+
+      (*a goal of this search solved without conditions is proved for the call, unless one of
+        its form is, where no more was assumed than here*)
+      fun solved goal solutions =
+        let val form_prop = form_prop_of goal in
+          if exists (fn {prems, ...}: proved => subset (op aconv) (prems, local_prems))
+              (Termtab.lookup_list (! proved) form_prop)
+          then ()
+          else
+            Unsynchronized.change proved (Termtab.map_default (form_prop, []) (fn entries =>
+              entries @
+               [{prems = local_prems, by = id,
+                 thm = Lazy.lazy (fn () =>
+                  prove ctxt
+                   (Intro.Goal
+                     {goal = form_prop, form = NONE,
+                      solutions = map solution_of (solutions ())}))}]))
+        end;
+
+      val names =
+        Unsynchronized.ref
+          (Variable.names_of (fold Variable.declare_term (prop :: local_prems) ctxt));
+      (*a search inside another one goes on from the goal that started it, one step further*)
+      val (start_dist, start_steps) =
+        (case levels of {dist, steps, ...} :: _ => (dist, steps + 1) | [] => (0, 0));
+      val max_solutions = Config.get ctxt max_solution_number;
+      (*a search that gives up while a condition of this one is simplified goes through this
+        one, with the marks of this one*)
+      val found =
+        Kernel.search
+         {key = key, steps = steps ctxt names, user_rule = user_rule, solved = solved,
+          simplify = simplify o inside, as_written = as_written, reading = reading #wrapper}
+         {max_search_distance = Config.get ctxt max_search_distance, max_leaps = leaps,
+          max_solution_number = max_solutions, unconditional = unconditional}
+         {goal = goal_of no_wrapper prop, dist = start_dist, steps = start_steps}
+        handle GIVE_UP marks => raise GIVE_UP (union (op =) (outer_marks ()) marks);
+      (*without a solution free of conditions, a search gives up where goals of it are not
+        told because of goals under way around it*)
+      fun unless_untold result =
+        (case outer_marks () of [] => result | marks => raise GIVE_UP marks);
+    in
+      (case found of
+        Kernel.Found {derivation, conditions, distance, cut_short, ...} =>
+          if cut_short andalso is_some around then raise Kernel.STOP
+          else
+            Intro.Found
+             {value = derivation_of derivation,
+              (*nothing was to be collected at the distance 0, nor where one solution is
+                all that is wanted*)
+              cut_short = cut_short andalso distance > 0 andalso max_solutions > 1}
+            |> not (null conditions) ? unless_untold
+      | Kernel.Failed Kernel.No_Plan => unless_untold (Intro.Failed Intro.No_Plan)
+      | Kernel.Failed Kernel.User_Limit =>
+          if is_some around then raise Kernel.STOP else Intro.Failed Intro.User_Limit)
+    end;
+
+(*max_distance: the greatest effective distance of a solution; else that of the option
+  concept_fact_max_leaps, which is the least one not allowed*)
+fun search {max_distance} ctxt prop =
+  run
+   {max_leaps = (case max_distance of SOME n => n + 1 | NONE => Config.get ctxt max_leaps),
+    unconditional = false} ctxt prop;
+
+fun search_unconditional ctxt prop =
+  (case run {max_leaps = 1, unconditional = true} ctxt prop of
+    Intro.Found {value, ...} => SOME value
+  | Intro.Failed _ => NONE);
 
 end;

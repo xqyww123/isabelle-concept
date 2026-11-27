@@ -1,7 +1,7 @@
 (*  Title:      concept_fact.ML
 
-The upper file of concept_fact: a derivation of the search replayed as a theorem; the entrance
-for goals that must leave no condition, and the procedure of the selector Simpset on it; the
+The upper file of concept_fact: the entrance for goals that must leave no condition, and the
+procedure of the selector Simpset on it; the
 proof method concept_fact and its tactic; the attribute [[concept_fact "P"]], whose entrance
 prove_proposition is that of the attribute of_concept too, and name_of, which prints that
 attribute for a proposition; the decision on the host premise of an instance.  Not yet: the
@@ -37,110 +37,7 @@ val search = Concept_Search.search;
 
 (** a derivation as a theorem **)
 
-(* the terms and theorems of a derivation *)
-
-fun map_derivation (f: term -> term) (g: thm -> thm) =
-  let
-    val eq = Option.map (Lazy.map g);
-    fun goal (Intro.Goal {goal = A, form, solutions}) =
-      Intro.Goal {goal = f A, form = eq form, solutions = map solution solutions}
-    and solution (Intro.Solution {entry, rule, converted, premises}) =
-      Intro.Solution
-       {entry = entry, rule = Lazy.map g rule, converted = converted,
-        premises = map premise premises}
-    and premise (Intro.Concept {params, hyps, derivation}) =
-          Intro.Concept
-           {params = map (dest_Free o f o Free) params, hyps = map f hyps,
-            derivation = goal derivation}
-      | premise (Intro.Remaining {cond, simp}) =
-          Intro.Remaining {cond = f cond, simp = eq simp};
-  in goal end;
-
-
-(* from the conditions to the goal *)
-
-(*A from Trueprop (formula_of A)*)
-fun prop_of_formula ctxt A th =
-  Thm.equal_elim (Thm.symmetric (Intro.formula_conv ctxt (Thm.cterm_of ctxt A))) th;
-
-(*the theorems of A1 ... An from that of A1 & (A2 & ... An), n > 0*)
-fun conjuncts 1 th = [th]
-  | conjuncts n th =
-      let val (th1, th2) = HOLogic.conj_elim th in th1 :: conjuncts (n - 1) th2 end;
-
-(*The goal of a derivation without schematic variables, from a theorem of its conditions as
-  Intro.conditions_of gives them.  Every step takes its theorem as the derivation has it: the
-  rule of a solution on the theorems of its premises, an equation backwards.  No step
-  unifies*)
-fun goal_thm ctxt (Intro.Goal {form, solutions, ...}) conditions =
-  let
-    val cterm = Thm.cterm_of ctxt;
-    fun backwards eq th =
-      (case eq of SOME eq' => Thm.equal_elim (Thm.symmetric (Lazy.force eq')) th | NONE => th);
-
-    (*the alternatives nest to the right*)
-    fun cases [solution] th = solution_thm solution th
-      | cases (solution :: rest) th =
-          let
-            val (P, Q) = Thm.dest_binop (HOLogic.dest_judgment (Thm.cprop_of th));
-            val (cP, cQ) = apply2 HOLogic.mk_judgment (P, Q);
-            val left = solution_thm solution (Thm.assume cP);
-            val R = HOLogic.dest_judgment (Thm.cprop_of left);
-          in
-            Drule.implies_elim_list
-              \<^instantiate>\<open>P and Q and R in
-                lemma (open) \<open>P \<or> Q \<Longrightarrow> (P \<Longrightarrow> R) \<Longrightarrow> (Q \<Longrightarrow> R) \<Longrightarrow> R\<close> by (rule disjE)\<close>
-              [th, Thm.implies_intr cP left, Thm.implies_intr cQ (cases rest (Thm.assume cQ))]
-          end
-      | cases [] _ = raise Fail "Concept_Fact.prove: a goal without a solution"
-
-    and solution_thm (Intro.Solution {rule, premises, ...}) th =
-      let
-        val rule' = Lazy.force rule;
-        val parts = if null premises then [] else conjuncts (length premises) th;
-      in
-        Drule.implies_elim_list rule'
-          (@{map 3} premise_thm premises (Thm.prems_of rule') parts)
-      end
-
-    (*the premise of the rule as the rule has it, from the theorem of what it leaves*)
-    and premise_thm (Intro.Remaining (condition as {simp, ...})) _ th =
-          backwards simp (prop_of_formula ctxt (Intro.shown_condition condition) th)
-      | premise_thm (Intro.Concept {params, hyps, derivation}) prem th =
-          let
-            (*what the premise leaves, under its parameters and hypotheses again*)
-            val left =
-              Logic.list_implies (hyps, HOLogic.mk_Trueprop (Intro.conditions_of derivation))
-              |> fold_rev (Logic.all o Free) params;
-            val under =
-              fold (Thm.forall_elim o cterm o Free) params (prop_of_formula ctxt left th);
-            (*the parameters and the hypotheses in the places that the premise has for them*)
-            fun close (\<^Const_>\<open>Pure.all _ for \<open>Abs (_, _, A)\<close>\<close>) (x :: xs) hyps' =
-                  Thm.forall_intr (cterm (Free x)) (close (Term.subst_bound (Free x, A)) xs hyps')
-              | close (\<^Const_>\<open>Pure.imp for A B\<close>) xs hyps' =
-                  Thm.implies_intr (cterm A) (close B xs (Thm.assume (cterm A) :: hyps'))
-              | close _ _ hyps' =
-                  goal_thm ctxt derivation (Drule.implies_elim_list under (rev hyps'));
-          in close prem params [] end;
-  in backwards form (cases solutions conditions) end;
-
-(*R1 ==> ... ==> Rr ==> the goal of the derivation, as it was given to the search: the
-  conditions that the search file hands to the user, and nothing else.  The schematic
-  variables, those of the goal and those that the rules leave, are fixed while the theorem is
-  made and come back as they were*)
-fun prove ctxt derivation =
-  let val tidied = Lazy.force (#proof (Concept_Search.tidy ctxt derivation)) in
-    Concept_Type.fixing ctxt (Thm.prop_of tidied :: Intro.derivation_terms derivation)
-      (fn ctxt' => fn freeze => fn fix =>
-        let
-          val tidied' = freeze tidied;
-          val conditions = Thm.cprems_of tidied';
-        in
-          Drule.implies_elim_list tidied' (map Thm.assume conditions)
-          |> goal_thm ctxt' (map_derivation fix freeze derivation)
-          |> Drule.implies_intr_list conditions
-        end)
-  end;
+val prove = Concept_Search.prove;
 
 fun unconditional_fact ctxt goal =
   Option.map (prove ctxt) (Concept_Search.search_unconditional ctxt goal);

@@ -268,15 +268,19 @@ sig
     Goal of {goal: term, form: equation option, solutions: solution list}
   and solution =
     Solution of
-     {entry: entry, rule: thm lazy, converted: bool, premises: premise list}
+     {entry: entry option, rule: thm lazy, converted: bool, premises: premise list}
   and premise =
-      Concept of {params: (string * typ) list, hyps: term list, derivation: derivation}
+      Concept of
+       {params: (string * (string * typ)) list, hyps: term list, derivation: derivation}
     | Remaining of {cond: term, simp: equation option}
   val derivation_terms: derivation -> term list
   val shown_condition: {cond: term, simp: equation option} -> term
   val formula_of: term -> term
   val formula_conv: Proof.context -> conv
   val conditions_of: derivation -> term
+  val under: {params: (string * (string * typ)) list, hyps: term list} -> term -> term
+  val map_derivation: (term -> term) -> (thm -> thm) -> derivation -> derivation
+  val goal_thm: Proof.context -> derivation -> thm -> thm
   datatype failure = No_Plan | User_Limit | Not_Concept_Goal
   datatype 'a result = Found of {value: 'a, cut_short: bool} | Failed of failure
   type destruct_work = {safe_intro: bool, notation: bool, masked_entries: bool}
@@ -813,13 +817,18 @@ fun match_rule ctxt ({concept = N, rule, pos, ...}: entry) form =
 
 type equation = thm lazy;
 
+(*a solution without an entry: its rule is a theorem that another search of the same call has
+  proved without conditions; it states the form of the goal and has no premise.  A parameter
+  of a premise: the name that its binder has in the rule, and the free variable that stands
+  for it in the hypotheses and below*)
 datatype derivation =
   Goal of {goal: term, form: equation option, solutions: solution list}
 and solution =
   Solution of
-   {entry: entry, rule: thm lazy, converted: bool, premises: premise list}
+   {entry: entry option, rule: thm lazy, converted: bool, premises: premise list}
 and premise =
-    Concept of {params: (string * typ) list, hyps: term list, derivation: derivation}
+    Concept of
+       {params: (string * (string * typ)) list, hyps: term list, derivation: derivation}
   | Remaining of {cond: term, simp: equation option};
 
 (*every term that a derivation speaks of, the parameters of its wrappers among them: with their
@@ -830,7 +839,7 @@ fun derivation_terms (Goal {goal, form, solutions}) =
     Thm.prop_of (Lazy.force rule) ::
     maps
       (fn Concept {params, hyps, derivation} =>
-            map Free params @ hyps @ derivation_terms derivation
+            map (Free o #2) params @ hyps @ derivation_terms derivation
         | Remaining {cond, simp} =>
             cond :: map (Thm.prop_of o Lazy.force) (the_list simp)) premises) solutions;
 
@@ -874,8 +883,101 @@ fun conditions_of (Goal {solutions, ...}) =
 and premise_conditions (Concept {params, hyps, derivation}) =
       conditions_of derivation
       |> fold_rev (fn hyp => fn A => HOLogic.mk_imp (formula_of hyp, A)) hyps
-      |> fold_rev (fn (x, T) => fn A => HOLogic.mk_all (x, T, A)) params
+      |> fold_rev (fn (_, (x, T)) => fn A => HOLogic.mk_all (x, T, A)) params
   | premise_conditions (Remaining condition) = formula_of (shown_condition condition);
+
+(*a proposition under the parameters and the hypotheses of a premise again: each parameter is
+  bound under the name that its binder has in the rule*)
+fun under {params, hyps} prop =
+  Logic.list_implies (hyps, prop) |> fold_rev (fn (x, v) => Logic.all_name (x, Free v)) params;
+
+
+(* the terms and theorems of a derivation *)
+
+fun map_derivation (f: term -> term) (g: thm -> thm) =
+  let
+    val eq = Option.map (Lazy.map g);
+    fun goal (Goal {goal = A, form, solutions}) =
+      Goal {goal = f A, form = eq form, solutions = map solution solutions}
+    and solution (Solution {entry, rule, converted, premises}) =
+      Solution
+       {entry = entry, rule = Lazy.map g rule, converted = converted,
+        premises = map premise premises}
+    and premise (Concept {params, hyps, derivation}) =
+          Concept
+           {params = map (apsnd (dest_Free o f o Free)) params, hyps = map f hyps,
+            derivation = goal derivation}
+      | premise (Remaining {cond, simp}) =
+          Remaining {cond = f cond, simp = eq simp};
+  in goal end;
+
+
+(* from the conditions to the goal *)
+
+(*A from Trueprop (formula_of A)*)
+fun prop_of_formula ctxt A th =
+  Thm.equal_elim (Thm.symmetric (formula_conv ctxt (Thm.cterm_of ctxt A))) th;
+
+(*the theorems of A1 ... An from that of A1 & (A2 & ... An), n > 0*)
+fun conjuncts 1 th = [th]
+  | conjuncts n th =
+      let val (th1, th2) = HOLogic.conj_elim th in th1 :: conjuncts (n - 1) th2 end;
+
+(*The goal of a derivation without schematic variables, from a theorem of its conditions as
+  conditions_of gives them.  Every step takes its theorem as the derivation has it: the
+  rule of a solution on the theorems of its premises, an equation backwards.  No step
+  unifies*)
+fun goal_thm ctxt (Goal {form, solutions, ...}) conditions =
+  let
+    val cterm = Thm.cterm_of ctxt;
+    fun backwards eq th =
+      (case eq of SOME eq' => Thm.equal_elim (Thm.symmetric (Lazy.force eq')) th | NONE => th);
+
+    (*the alternatives nest to the right*)
+    fun cases [solution] th = solution_thm solution th
+      | cases (solution :: rest) th =
+          let
+            val (P, Q) = Thm.dest_binop (HOLogic.dest_judgment (Thm.cprop_of th));
+            val (cP, cQ) = apply2 HOLogic.mk_judgment (P, Q);
+            val left = solution_thm solution (Thm.assume cP);
+            val R = HOLogic.dest_judgment (Thm.cprop_of left);
+          in
+            Drule.implies_elim_list
+              \<^instantiate>\<open>P and Q and R in
+                lemma (open) \<open>P \<or> Q \<Longrightarrow> (P \<Longrightarrow> R) \<Longrightarrow> (Q \<Longrightarrow> R) \<Longrightarrow> R\<close> by (rule disjE)\<close>
+              [th, Thm.implies_intr cP left, Thm.implies_intr cQ (cases rest (Thm.assume cQ))]
+          end
+      | cases [] _ = raise Fail "Concept_Intro_Table.goal_thm: a goal without a solution"
+
+    and solution_thm (Solution {rule, premises, ...}) th =
+      let
+        val rule' = Lazy.force rule;
+        val parts = if null premises then [] else conjuncts (length premises) th;
+      in
+        Drule.implies_elim_list rule'
+          (@{map 3} premise_thm premises (Thm.prems_of rule') parts)
+      end
+
+    (*the premise of the rule as the rule has it, from the theorem of what it leaves*)
+    and premise_thm (Remaining (condition as {simp, ...})) _ th =
+          backwards simp (prop_of_formula ctxt (shown_condition condition) th)
+      | premise_thm (Concept {params, hyps, derivation}) prem th =
+          let
+            (*what the premise leaves, under its parameters and hypotheses again*)
+            val left =
+              under {params = params, hyps = hyps}
+                (HOLogic.mk_Trueprop (conditions_of derivation));
+            val opened =
+              fold (Thm.forall_elim o cterm o Free o #2) params (prop_of_formula ctxt left th);
+            (*the parameters and the hypotheses in the places that the premise has for them*)
+            fun close (\<^Const_>\<open>Pure.all _ for \<open>Abs (_, _, A)\<close>\<close>) ((_, x) :: xs) hyps' =
+                  Thm.forall_intr (cterm (Free x)) (close (Term.subst_bound (Free x, A)) xs hyps')
+              | close (\<^Const_>\<open>Pure.imp for A B\<close>) xs hyps' =
+                  Thm.implies_intr (cterm A) (close B xs (Thm.assume (cterm A) :: hyps'))
+              | close _ _ hyps' =
+                  goal_thm ctxt derivation (Drule.implies_elim_list opened (rev hyps'));
+          in close prem params [] end;
+  in backwards form (cases solutions conditions) end;
 
 datatype failure = No_Plan | User_Limit | Not_Concept_Goal;
 
