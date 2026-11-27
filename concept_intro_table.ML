@@ -2,11 +2,12 @@
 
 The intro table of concept_fact: its entries and their keys, the form of a concept fact, the
 rules that apply to a goal, and the derivations that the search gives.  What fills the table
-belongs here too.  Written: the attribute concept_intro with strengthening, the declaration
-of extraction rules by the attribute concept_extraction, assumption destruction with
-activation, and the activation list of a concept at its declaration.  Not yet: activation
-where a rule is declared, the entries of instances and of imports, the hook on the facts of
-a context, the handler of mksimps.
+belongs here too: the attribute concept_intro with strengthening; the declaration of
+extraction rules by the attribute concept_extraction; assumption destruction with activation,
+for facts with and without premises; the activation list of a concept at its declaration; what
+a declaration in a theory stores, for a rule, an instance and an import; the function on the
+facts that a context indexes, with the option auto_concept_extraction; the handler of simp for
+the premises that the simplifier assumes.
 *)
 
 (*** The check on a chain of steps ***)
@@ -249,9 +250,7 @@ end;
 signature CONCEPT_INTRO_TABLE =
 sig
   datatype safety = Unsafe | Safe_By_User | Safe_By_System
-  type entry =
-   {concept: string, rule: thm, user: bool, safety: safety,
-    mask: (Proof.context -> bool) option, pos: Position.T}
+  type entry = {concept: string, rule: thm, user: bool, safety: safety, pos: Position.T}
   val dest_fact: theory -> term -> (string * string * term) option
   val is_concept_premise: theory -> term -> bool
   type form
@@ -292,6 +291,12 @@ sig
   val mark_handled: thm -> thm
   val extraction_limit: int Config.T
   val extraction_trace: bool Config.T
+  val fact_context: Proof.context -> thm -> thm * Proof.context
+  val add_instance_entries: {rule: thm, theorem: thm} -> theory -> theory
+  val add_system_entries: {rule: thm, safety: safety option} list -> theory -> theory
+  val has_work: theory -> term -> bool  (*for tests*)
+  val auto_extraction: bool Config.T
+  val concept_extract: Proof.context -> Proof.context
 end;
 
 (*the form of a concept fact, sealed inside Concept_Intro_Table*)
@@ -318,14 +323,13 @@ struct
 
 datatype safety = Unsafe | Safe_By_User | Safe_By_System;
 
-(*an entry has no name: what refers to a concept fact gives its proposition.  pos: where a
-  user declared the rule, none for an entry that the system makes*)
-type entry =
- {concept: string, rule: thm, user: bool, safety: safety,
-  mask: (Proof.context -> bool) option, pos: Position.T};
+(*an entry as it is handed out, with the theorem that holds where it is asked for.  It has no
+  name: what refers to a concept fact gives its proposition.  pos: where a user declared the
+  rule, none for an entry that the system makes*)
+type entry = {concept: string, rule: thm, user: bool, safety: safety, pos: Position.T};
 
-fun map_entry_rule f ({concept, rule, user, safety, mask, pos}: entry) : entry =
-  {concept = concept, rule = f rule, user = user, safety = safety, mask = mask, pos = pos};
+fun map_entry_rule f ({concept, rule, user, safety, pos}: entry) : entry =
+  {concept = concept, rule = f rule, user = user, safety = safety, pos = pos};
 
 
 
@@ -523,22 +527,69 @@ fun stronger (Safe_By_System, _) = Safe_By_System
   | stronger (Safe_By_User, _) = Safe_By_User
   | stronger (_, safety) = safety;
 
+(*What a part of the table has for one proposition, and what the set says of a key: one value
+  usable everywhere, or one for each premise of the simplifier that gave it, with the mask of
+  that premise, in the order they came; never both.  A value is added only where none serves
+  the call, so masks are never compared.  That a masked value is used only where it holds, and
+  wherever it holds, rests on the simplifier: a premise in force stays in force below*)
+datatype 'a masked = Unmasked of 'a | Masked of ('a * (Proof.context -> bool)) list;
+
+fun map_masked f (Unmasked a) = Unmasked (f a)
+  | map_masked f (Masked alts) = Masked (map (apfst f) alts);
+
+fun usable _ (Unmasked a) = SOME a
+  | usable ctxt (Masked alts) = Option.map #1 (find_first (fn (_, mask) => mask ctxt) alts);
+
+(*a value usable wherever what a call with this mask writes is used.  A masked call runs where
+  its premise is in force (destruct_facts): a masked value usable there is usable wherever
+  that premise is*)
+fun serving ctxt mask m =
+  (case (mask, m) of
+    (_, Unmasked a) => SOME a
+  | (NONE, Masked _) => NONE
+  | (SOME _, _) => usable ctxt m);
+
+fun add_masked (NONE, a) _ = Unmasked a
+  | add_masked (SOME mask, a) NONE = Masked [(a, mask)]
+  | add_masked (SOME mask, a) (SOME (Masked alts)) = Masked (alts @ [(a, mask)])
+  | add_masked (SOME _, _) (SOME m) = m;
+
+(*the mask of what a masked call writes for the theorem th0 that the handler of simp got*)
+fun mask_of th0 ctxt = Raw_Simplifier.simproc_can_use_thm ctxt th0;
+
+(*an entry as the table keeps it*)
+type stored = {concept: string, rules: thm masked, user: bool, safety: safety, pos: Position.T};
+
+fun first_rule ({rules, ...}: stored) =
+  (case rules of Unmasked th => th | Masked alts => #1 (hd alts));
+
+fun map_rules f ({concept, rules, user, safety, pos}: stored) : stored =
+  {concept = concept, rules = map_masked f rules, user = user, safety = safety, pos = pos};
+
+fun with_mark safety ({concept, rules, user, safety = safety', pos}: stored) : stored =
+  {concept = concept, rules = rules, user = user, safety = stronger (safety, safety'), pos = pos};
+
 (*of two entries of one proposition one stays: one without a mask, then one of a user, then the
-  lesser theorem; the same whichever came first, up to theorems that Thm.thm_ord does not tell
-  apart.  It gets the stronger mark of the two*)
-fun join_entries (e: entry, e': entry) : entry =
+  lesser theorem; two with masks keep the theorems of both, those of the first one first.  It
+  gets the stronger mark of the two*)
+fun join_entries (s: stored, s': stored) : stored =
   let
-    fun rank ({user, mask, ...}: entry) = (is_some mask, not user);
-    val ord = prod_ord bool_ord bool_ord o apply2 rank ||| Thm.thm_ord o apply2 #rule;
-    val {concept, rule, user, mask, pos, ...} = if ord (e, e') = GREATER then e' else e;
+    fun rank ({rules, user, ...}: stored) =
+      (case rules of Unmasked _ => false | Masked _ => true, not user);
+    val ord = prod_ord bool_ord bool_ord o apply2 rank ||| Thm.thm_ord o apply2 first_rule;
+    val {concept, rules, user, pos, ...} = if ord (s, s') = GREATER then s' else s;
+    val rules' =
+      (case (#rules s, #rules s') of
+        (Masked alts, Masked alts') => Masked (alts @ alts')
+      | _ => rules);
   in
-    {concept = concept, rule = rule, user = user, safety = stronger (#safety e, #safety e'),
-     mask = mask, pos = pos}
+    {concept = concept, rules = rules', user = user, safety = stronger (#safety s, #safety s'),
+     pos = pos}
   end;
 
 (*the entries of a key, each by its proposition with canonical variables: one entry of one
   proposition*)
-type table = entry Termtab.table Symtab.table;
+type table = stored Termtab.table Symtab.table;
 
 fun entries_of (tab: table) key = the_default Termtab.empty (Symtab.lookup tab key);
 
@@ -570,31 +621,31 @@ structure Contextual = Proof_Data
   fun init _ = Symtab.empty;
 );
 
-fun entry_of ({fact, user, safety, mask, pos}: registration) : entry =
-  {concept = Form.concept (Form.conclusion fact), rule = Form.thm_of fact, user = user,
-   safety = safety, mask = mask, pos = pos};
+fun entry_of ({fact, user, safety, mask, pos}: registration) : stored =
+  {concept = Form.concept (Form.conclusion fact),
+   rules = add_masked (mask, Form.thm_of fact) NONE, user = user, safety = safety, pos = pos};
 
 fun place thy ({fact, ...}: registration) =
   (key_of thy (Form.inner (Form.conclusion fact)), entry_prop fact);
 
-fun insert (key, prop) (e: entry) (tab: table) =
+fun insert (key, prop) (e: stored) (tab: table) =
   Symtab.update (key,
     Termtab.map_default (prop, e) (fn e' => join_entries (e', e)) (entries_of tab key)) tab;
 
 in
 
-(*whether the proposition is new to the table*)
-fun add_static (r: registration) thy =
-  let
-    val (key, prop) = place thy r;
-    val tab = Static.get thy;
-  in
-    (not (Termtab.defined (entries_of tab key) prop),
-     Static.put (insert (key, prop) (map_entry_rule Thm.trim_context (entry_of r)) tab) thy)
-  end;
+(*The only writer of the part of the theory.  made gets the theory before anything of this
+  registration is in it; what it gives goes in at once, so no entry of a registration can hide
+  the activation of another*)
+fun register_theory (made: theory -> registration list) thy =
+  Static.put
+    (fold (fn r => insert (place thy r) (map_rules Thm.trim_context (entry_of r)))
+      (made thy) (Static.get thy))
+    thy;
 
-(*whether the proposition is new to the table.  An entry that the static part has with a mark
-  at least as strong is not put: the contextual part stays small*)
+(*whether the proposition is new to the table.  Nothing is written where the static part has
+  the entry with a mark at least as strong: the contextual part stays small.  Where an entry
+  serves the call, a masked registration only gives it its mark*)
 fun add_contextual (r: registration) ctxt =
   let
     val thy = Proof_Context.theory_of ctxt;
@@ -605,11 +656,18 @@ fun add_contextual (r: registration) ctxt =
       (case static of
         SOME e => stronger (#safety e, #safety r) = #safety e
       | NONE => false);
+    val served =
+      (case Termtab.lookup (entries_of tab key) prop of
+        SOME s => is_some (serving ctxt (#mask r) (#rules s))
+      | NONE => false);
   in
     if covered then (false, ctxt)
     else
-      (is_none static andalso not (Termtab.defined (entries_of tab key) prop),
-       Contextual.put (insert (key, prop) (entry_of r) tab) ctxt)
+      (is_none static andalso not served,
+       Contextual.put
+        (if served andalso is_some (#mask r)
+         then Symtab.map_entry key (Termtab.map_entry prop (with_mark (#safety r))) tab
+         else insert (key, prop) (entry_of r) tab) ctxt)
   end;
 
 (*the contextual part as a whole: a fact that the limit has cut is taken apart again on what
@@ -618,9 +676,10 @@ val contextual_part = Contextual.get;
 val put_contextual_part = Contextual.put;
 
 (*those under the key of the goal, under the keys linked to it, under the key of the parameter
-  that "where super = ..." names, and the facts on schematic structures; without those that
-  their mask rules out now; an entry of each part for one proposition joined into one; in the
-  order of their theorems*)
+  that "where super = ..." names, and the facts on schematic structures; an entry that
+  premises of the simplifier gave has the first of their theorems that holds now, and is left
+  out where none does; an entry of each part for one proposition joined into one; in the order
+  of their theorems*)
 fun entries_for ctxt form =
   let
     val thy = Proof_Context.theory_of ctxt;
@@ -634,15 +693,25 @@ fun entries_for ctxt form =
           | NONE => [])
       | _ => []);
     val keys = distinct (op =) (key :: Concept_Type.linked_keys thy key @ super @ [schematic_key]);
-    fun usable (es: entry Termtab.table) =
-      Termtab.fold (fn (prop, {mask, ...}) =>
-        (case mask of SOME test => not (test ctxt) ? Termtab.delete prop | NONE => I)) es es;
+    fun now (es: stored Termtab.table) =
+      Termtab.fold (fn (prop, s: stored) =>
+        (case #rules s of
+          Unmasked _ => I
+        | Masked alts =>
+            (case find_first (fn (_, mask) => mask ctxt) alts of
+              SOME alt =>
+                Termtab.update (prop,
+                  {concept = #concept s, rules = Masked [alt], user = #user s,
+                   safety = #safety s, pos = #pos s})
+            | NONE => Termtab.delete prop))) es es;
+    fun handed_out (s: stored) : entry =
+      {concept = #concept s, rule = first_rule s, user = #user s, safety = #safety s, pos = #pos s};
     val static = Static.get thy and contextual = Contextual.get ctxt;
   in
     keys |> maps (fn key =>
-      (usable (entries_of static key), usable (entries_of contextual key))
+      (entries_of static key, now (entries_of contextual key))
       |> Termtab.join (K join_entries)
-      |> Termtab.dest |> map #2)
+      |> Termtab.dest |> map (handed_out o #2))
     |> map (map_entry_rule (Thm.transfer' ctxt))
     |> sort (Thm.thm_ord o apply2 #rule)
   end;
@@ -985,7 +1054,7 @@ datatype 'a result = Found of {value: 'a, cut_short: bool} | Failed of failure;
 
 
 
-(** the attribute concept_intro **)
+(** an introduction rule: where it is declared, its strengthening, what a declaration refuses **)
 
 val extraction_limit = Attrib.setup_config_int \<^binding>\<open>concept_extraction_limit\<close> (K 300);
 val extraction_trace = Attrib.setup_config_bool \<^binding>\<open>concept_extraction_trace\<close> (K false);
@@ -1031,40 +1100,28 @@ fun strengthened ctxt (fact, safety) =
     | _ => unchanged)
   end;
 
-(*pos: where the attribute stands.  To do: activation; taking a fact without premises apart*)
-fun register_rule {safe} pos th context =
-  if on_level context then context
-  else
-    let
-      val ctxt = Context.proof_of context;
-      val thy = Proof_Context.theory_of ctxt;
-      val print = quote o Syntax.string_of_term ctxt;
-      val fact =
-        (case Form.of_thm ctxt th of
-          SOME fact => fact
-        | NONE =>
-            error ("Users are not allowed to declare a concept_intro rule whose conclusion \
-              \is not a concept fact. The conclusion of your " ^ print (Thm.prop_of th) ^
-              " must have the form \"concept_predicate structure\""));
-      val form = Form.conclusion fact;
-      val _ =
-        (case schematic_head form of
-          SOME head =>
-            error ("Users are not allowed to declare a concept_intro rule whose conclusion is \
-              \about an arbitrary " ^
-              quote (Proof_Context.extern_const ctxt (Form.concept form)) ^
-              " structure. The " ^ Syntax.string_of_term ctxt head ^ " in your " ^
-              print (HOLogic.dest_Trueprop (Thm.concl_of th)) ^ " must not be a variable")
-        | NONE => ());
-      val registrations =
-        strengthened ctxt (fact, if safe then Safe_By_User else Unsafe)
-        |> map (fn (fact', safety) =>
-            {fact = fact', user = true, safety = safety, mask = NONE, pos = pos}: registration);
-    in
-      (case context of
-        Context.Theory _ => Context.Theory (fold (#2 oo add_static) registrations thy)
-      | Context.Proof _ => Context.Proof (fold (#2 oo add_contextual) registrations ctxt))
-    end;
+(*the shapes that a declaration of concept_intro refuses; it gives the fact of the rule*)
+fun check_rule ctxt th =
+  let
+    val print = quote o Syntax.string_of_term ctxt;
+    val fact =
+      (case Form.of_thm ctxt th of
+        SOME fact => fact
+      | NONE =>
+          error ("Users are not allowed to declare a concept_intro rule whose conclusion \
+            \is not a concept fact. The conclusion of your " ^ print (Thm.prop_of th) ^
+            " must have the form \"concept_predicate structure\""));
+    val form = Form.conclusion fact;
+    val _ =
+      (case schematic_head form of
+        SOME head =>
+          error ("Users are not allowed to declare a concept_intro rule whose conclusion is \
+            \about an arbitrary " ^
+            quote (Proof_Context.extern_const ctxt (Form.concept form)) ^
+            " structure. The " ^ Syntax.string_of_term ctxt head ^ " in your " ^
+            print (HOLogic.dest_Trueprop (Thm.concl_of th)) ^ " must not be a variable")
+      | NONE => ());
+  in fact end;
 
 
 
@@ -1083,9 +1140,11 @@ fun is_handled th = Properties.defined (Thm.get_tags th) handledN;
 
 (** extraction rules **)
 
-(*A rule with one premise that takes a proposition apart which is no concept fact, such as
-  sub C G H ==> C G (section 4 of the plan of defining contexts).  The rules are kept in
-  beta-eta normal form, by their premises.  The store holds declarations: each has a key of
+(*A rule that takes a proposition apart which is no concept fact, such as sub C G H ==> C G
+  (section 4 of the plan of defining contexts).  The proposition is matched against its first
+  premise; further premises stay on what it takes out, as in ALL x:A. P x ==> x : A ==> P x.
+  The rules are kept in beta-eta normal form, by their first premises.  The store holds
+  declarations: each has a key of
   its own, the theory of the declaration and its number among those of that theory, so a merge
   of theories is a union.  The rules of one proposition are used in the order of their keys,
   whatever the order of the imports.  A rule declared more than once, also with other names of
@@ -1152,18 +1211,24 @@ fun check_extraction ctxt written th =
     val written_prem = quote (show (the_default Term.dummy (try hd (Thm.prems_of written))));
     fun refuse what advice =
       error ("Users are not allowed to declare a concept_extraction rule " ^ what ^ ". " ^ advice);
+    val prems = Thm.prems_of th;
     val prem =
-      (case Thm.prems_of th of
-        [prem] => prem
-      | [] => refuse "without a premise" ("Your " ^ rule ^ " must have exactly one premise")
-      | prems =>
-          refuse ("with " ^ string_of_int (length prems) ^ " premises")
-            ("Your " ^ rule ^ " must have exactly one premise"));
+      (case prems of
+        prem :: _ => prem
+      | [] => refuse "without a premise" ("Your " ^ rule ^ " must have at least one premise"));
+    (*how the texts name the premise that a proposition is matched against*)
+    val premise = if length prems = 1 then "premise" else "first premise";
     val concl = Thm.concl_of th;
     val body = (case prem of \<^Const_>\<open>Trueprop for A\<close> => A | _ => prem);
-    val concl_body = (case concl of \<^Const_>\<open>Trueprop for A\<close> => A | _ => concl);
+    val concl_body =
+      (case concl of
+        \<^Const_>\<open>Trueprop for A\<close> => A
+      | _ =>
+          refuse "whose conclusion is not a proposition of HOL"
+            ("The conclusion " ^ quote (show (Thm.concl_of written)) ^ " of your " ^ rule ^
+              " must be a proposition of HOL"));
     fun split kind =
-      refuse ("whose premise is a " ^ kind)
+      refuse ("whose " ^ premise ^ " is a " ^ kind)
         ("The " ^ written_prem ^ " in your " ^ rule ^
           " is split before any concept_extraction rule is tried");
     val _ =
@@ -1174,7 +1239,7 @@ fun check_extraction ctxt written th =
       | _ => ());
     val _ =
       if is_some (dest_fact thy prem) then
-        refuse "whose premise is a concept fact"
+        refuse ("whose " ^ premise ^ " is a concept fact")
           ("The " ^ written_prem ^ " in your " ^ rule ^
             " is taken apart by concept instances, not by concept_extraction rules")
       else ();
@@ -1187,13 +1252,13 @@ fun check_extraction ctxt written th =
     val _ =
       (case Term.head_of body of
         head as Var _ =>
-          refuse "whose premise fits any proposition"
+          refuse ("whose " ^ premise ^ " fits any proposition")
             ("The " ^ show head ^ " in your " ^ rule ^ " must not be a variable")
       | _ => ());
     val _ =
       (case applied_variable body of
         SOME (head, arg) =>
-          refuse "whose premise applies a variable to a term"
+          refuse ("whose " ^ premise ^ " applies a variable to a term")
             ("The " ^ show head ^ " in your " ^ rule ^ " must not be applied to " ^
               (if is_Var arg then show arg else quote (show arg)))
       | NONE => ());
@@ -1204,18 +1269,20 @@ fun check_extraction ctxt written th =
           if member (op =) prem_vars v then ()
           else
             refuse "whose conclusion can never be a concept fact"
-              ("The " ^ show head ^ " in your " ^ rule ^ " must occur in the premise")
+              ("The " ^ show head ^ " in your " ^ rule ^ " must occur in the " ^ premise)
       | _ => ());
+    (*the further premises stay on what the rule takes out: a variable of the conclusion may
+      come from any of them*)
     val _ =
-      (case subtract (op =) prem_vars (rev (Term.add_vars concl [])) of
+      (case subtract (op =) (fold Term.add_vars prems []) (rev (Term.add_vars concl [])) of
         [] => ()
       | vars =>
           refuse
-            (if length vars = 1 then
-              "whose conclusion has a variable that its premise does not have"
-             else "whose conclusion has variables that its premise does not have")
+            ("whose conclusion has " ^ (if length vars = 1 then "a variable" else "variables") ^
+              " that its " ^
+              (if length prems = 1 then "premise does not have" else "premises do not have"))
             ("The " ^ plural (map (show o Var) vars) ^ " in your " ^ rule ^
-              " must occur in the premise"));
+              " must occur in " ^ (if length prems = 1 then "the premise" else "a premise")));
   in () end;
 
 end;
@@ -1248,17 +1315,6 @@ val _ =
       "declaring a so-called extraction rule, used to extract concept facts from the applicable \
       \propositions");
 
-(*the attribute is defined on its whole source, which has the position of its name; Attrib.setup
-  hands over the arguments alone*)
-val _ =
-  Theory.setup
-    (Attrib.define_global \<^binding>\<open>concept_intro\<close>
-      (fn src =>
-        Attrib.attribute_syntax
-          (Scan.lift (Scan.optional (Args.bang >> K true) false) >> (fn safe =>
-            Thm.declaration_attribute
-              (register_rule {safe = safe} (#2 (Token.name_of_src src))))) src)
-      "declaring an introduction rule, used to prove that a structure is a concept" #> #2);
 
 
 
@@ -1267,13 +1323,14 @@ val _ =
 (*What happens to a fact that enters a context (sections 2 and 4A of the plan of defining
   contexts).  The fact is taken apart: conjunctions and universal quantifications are opened,
   the instance term of a concept fact gives what the instance was declared with, a relation
-  fact gives what the extraction rules make of it.  Each concept fact on the way goes into the
-  table, strengthened, and is activated: the activation list of its concept gives more
-  entries.  The work is done in rounds, each a first stage in breadth-first order and then its
-  activations; what an activation result needs beyond its list, its further work, belongs to
-  the next round.  A check on the chain of steps of each node lets the work end.  A limit on
-  the counted steps of one fact keeps it short; what the limit stops is recorded, and done when
-  a later fact comes to it*)
+  fact gives what the extraction rules make of it.  A fact may have premises: every step reads
+  its conclusion, and the premises stay on what the step gives; they are never taken apart
+  themselves.  Each concept fact on the way goes into the table, strengthened, and is
+  activated: the activation list of its concept gives more entries.  The work is done in rounds,
+  each a first stage in breadth-first order and then its activations; what an activation result
+  needs beyond its list, its further work, belongs to the next round.  A check on the chain of
+  steps of each node lets the work end.  A limit on the counted steps of one fact keeps it
+  short; what the limit stops is recorded, and done when a later fact comes to it*)
 
 (*what a call does beside that, and where it is made (the table of 4A.3): the site sets the
   limit and what is recorded*)
@@ -1297,9 +1354,6 @@ fun activation_list thy C = map (Thm.transfer thy) (Symtab.lookup_list (Activati
 
 (* what a context keeps beside its entries *)
 
-(*the key of a concept fact in what follows: the proposition of its form*)
-fun fact_key fact = canonical (Form.prop (Form.conclusion fact));
-
 (*What an activation result needs beyond the list that gave it (4A.3).  changed: the selector
   Simpset has changed the head of its structure; apart: into an instance, whose term is to be
   taken apart; supplements: the new entries that strengthening gave it in another concept, each
@@ -1309,22 +1363,20 @@ type further = {fact: Form.fact, changed: bool, apart: bool, supplements: Form.f
 (*A piece of work that the limit has stopped (4A.5): a node that passed the check, with the
   step that the limit refused it.  record: that of the node as it arrived, without the node.
   recorder: the key of the fact that came in for the traversal which recorded the piece.
-  mask: that of the refused node, the mask of the fact whose theorem the node's comes from;
-  for a piece refused while another was continued, the mask of that other piece.  names: the
-  entries under which the piece is named; a node that meets one of them continues the piece*)
+  names: the entries under which the piece is named; a node that meets one of them continues
+  the piece.  Only a call without a mask leaves pieces*)
 datatype stopped_step =
   Apply_Rules of thm         (*to a relation fact*)
 | Take_Apart of Form.fact    (*a concept fact of the first stage*)
 | Further_Work of further;   (*of an activation result in the table*)
 
 type stopped =
- {step: stopped_step, record: Concept_Check.record, recorder: term,
-  mask: (Proof.context -> bool) option, names: Termset.T};
+ {step: stopped_step, record: Concept_Check.record, recorder: term, names: Termset.T};
 
 (*the kind of a step and the key of its proposition*)
 fun step_key (Apply_Rules th) = (0, canonical (Thm.prop_of th))
-  | step_key (Take_Apart fact) = (1, fact_key fact)
-  | step_key (Further_Work {fact, ...}) = (2, fact_key fact);
+  | step_key (Take_Apart fact) = (1, entry_prop fact)
+  | step_key (Further_Work {fact, ...}) = (2, entry_prop fact);
 
 (*one piece: the same step on the same proposition, the same record, the same recorder*)
 fun same_stopped (piece: stopped, piece': stopped) =
@@ -1332,51 +1384,71 @@ fun same_stopped (piece: stopped, piece': stopped) =
   #recorder piece aconv #recorder piece' andalso
   Concept_Check.same (#record piece, #record piece');
 
-fun add_names names ({step, record, recorder, mask, names = names'}: stopped) : stopped =
-  {step = step, record = record, recorder = recorder, mask = mask,
-   names = Termset.merge (names', names)};
+fun add_names names ({step, record, recorder, names = names'}: stopped) : stopped =
+  {step = step, record = record, recorder = recorder, names = Termset.merge (names', names)};
 
 (*The propositions that have gone through the first stage in a context (4A.4), by their keys:
   that of a concept fact, any other proposition in beta-eta normal form with canonical
   variables.  A fact that came in and below which the limit has left work is capped at that
-  limit, and keeps what its context had before it was taken apart*)
+  limit, and keeps what its context had before it was taken apart.  A key has one note usable
+  everywhere, written by a call without a mask, or one note for each premise of the simplifier
+  that took the proposition apart*)
 datatype status =
   Not_Capped
-| Capped of {limit: int, entries: table, seen: status Termtab.table, stopped: stopped list};
+| Capped of
+   {limit: int, entries: table, seen: status masked Termtab.table, stopped: stopped list};
 
 (*stopped: in the order in which the pieces were recorded*)
 structure Destruction = Proof_Data
 (
-  type T = {seen: status Termtab.table, stopped: stopped list};
+  type T = {seen: status masked Termtab.table, stopped: stopped list};
   fun init _ = {seen = Termtab.empty, stopped = []};
 );
 
 fun map_seen f = Destruction.map (fn {seen, stopped} => {seen = f seen, stopped = stopped});
 fun map_stopped f = Destruction.map (fn {seen, stopped} => {seen = seen, stopped = f stopped});
 
+(*what the set says of a key to a call with this mask*)
+fun noted ctxt mask seen key = Option.mapPartial (serving ctxt mask) (Termtab.lookup seen key);
+
+fun add_note mask (key, status) seen =
+  Termtab.update (key, add_masked (mask, status) (Termtab.lookup seen key)) seen;
+
 (*for tests: the keys of the facts that are capped, each with its limit; the stopped work,
   each piece by the key of its proposition with the entries under which it is named*)
 fun destruction_state ctxt =
   let val {seen, stopped} = Destruction.get ctxt in
-    {capped = Termtab.fold (fn (key, Capped {limit, ...}) => cons (key, limit) | _ => I) seen [],
+    {capped =
+       Termtab.fold (fn (key, note) =>
+         (case usable ctxt note of SOME (Capped {limit, ...}) => cons (key, limit) | _ => I)) seen [],
      stopped = map (fn {step, names, ...} => (#2 (step_key step), Termset.dest names)) stopped}
   end;
-
-(*the stopped work that a context can use now*)
-fun stopped_work ctxt =
-  #stopped (Destruction.get ctxt)
-  |> filter (fn {mask, ...} => (case mask of SOME test => test ctxt | NONE => true));
 
 (*the entries of a concept fact: what its step into the table puts or meets*)
 fun entries_of ctxt fact = map (entry_prop o #1) (strengthened ctxt (fact, Unsafe));
 
-(*what the set says of a concept fact (4A.4).  A fact recorded as not capped counts as absent
-  while work is named under an entry of it: it goes through the first stage once more, and so
-  comes to that work*)
-fun status_of ctxt fact =
-  (case Termtab.lookup (#seen (Destruction.get ctxt)) (fact_key fact) of
+(*the mark of what a traversal or the handler of simp puts: a fact without premises is safe;
+  under premises it is a rule whose premises are only sufficient*)
+fun put_safety fact = if Thm.no_prems (Form.thm_of fact) then Safe_By_System else Unsafe;
+
+(*a fact goes into the table of a context, with a mask or none: it is strengthened, and each
+  entry is put unless the table has what serves; each registration with whether it is new*)
+fun put_strengthened mask fact ctxt =
+  fold_map (fn (fact', safety) => fn ctxt' =>
+      let
+        val registration: registration =
+          {fact = fact', user = false, safety = safety, mask = mask, pos = Position.none};
+        val (new, ctxt'') = add_contextual registration ctxt';
+      in ((registration, new), ctxt'') end)
+    (strengthened ctxt (fact, put_safety fact)) ctxt;
+
+(*what the set says of a concept fact to a call with this mask (4A.4).  A fact recorded as not
+  capped counts as absent while work is named under an entry of it: it goes through the first
+  stage once more, and so comes to that work*)
+fun status_of ctxt mask fact =
+  (case noted ctxt mask (#seen (Destruction.get ctxt)) (entry_prop fact) of
     SOME Not_Capped =>
-      (case stopped_work ctxt of
+      (case #stopped (Destruction.get ctxt) of
         [] => SOME Not_Capped
       | work =>
           if exists (fn entry => exists (fn piece => Termset.member (#names piece) entry) work)
@@ -1387,51 +1459,58 @@ fun status_of ctxt fact =
 
 (* the parts of a fact *)
 
-(*a rule with its first premise matched against a theorem and discharged by it, in beta-eta
-  normal form like the theorem; the schematic variables of the theorem stay*)
+(*a theorem in the form of a fact that comes in: HHF, its outer parameters schematic, in
+  beta-eta normal form*)
+fun normal ctxt th =
+  Raw_Simplifier.norm_hhf ctxt th |> Conv.fconv_rule Drule.beta_eta_conversion;
+
+(*a rule with its first premise matched against the conclusion of a theorem, the theorem put in
+  its place: the premises of the theorem first, then the other premises of the rule.  The match
+  binds only the variables of the rule, whose indexes lie above those of the theorem; the
+  composition has nothing left to unify, so the variables of the theorem stay*)
 fun elim_first ctxt rule th =
   let
     val rule' = Thm.incr_indexes (Thm.maxidx_of th + 1) rule;
     val env =
       Pattern.match (Proof_Context.theory_of ctxt)
-        (Envir.beta_eta_contract (Thm.major_prem_of rule'), Thm.prop_of th)
+        (Envir.beta_eta_contract (Thm.major_prem_of rule'), Thm.concl_of th)
         (Vartab.empty, Vartab.empty);
     val (instT, inst) = instantiation env;
+    val rule'' =
+      Thm.instantiate
+        (TVars.map (K (Thm.ctyp_of ctxt)) instT, Vars.map (K (Thm.cterm_of ctxt)) inst) rule'
+      |> Conv.fconv_rule Drule.beta_eta_conversion;
   in
-    Thm.instantiate
-      (TVars.map (K (Thm.ctyp_of ctxt)) instT, Vars.map (K (Thm.cterm_of ctxt)) inst) rule'
-    |> Conv.fconv_rule Drule.beta_eta_conversion
-    |> (fn rule'' => Thm.implies_elim rule'' th)
+    Thm.bicompose (SOME ctxt) {flatten = false, match = true, incremented = true}
+      (false, th, Thm.nprems_of th) 1 rule''
+    |> Seq.hd |> normal ctxt
   end;
 
-(*a theorem opened at the conjunctions and universal quantifications of HOL at its head, each
-  part in beta-eta normal form; a theorem with premises is one part*)
+(*a theorem opened at the conjunctions and universal quantifications of HOL at the head of its
+  conclusion, each part in beta-eta normal form; its premises stay on every part*)
 fun open_fact th =
-  (case (Thm.no_prems th, Thm.concl_of th) of
-    (true, \<^Const_>\<open>Trueprop for \<^Const_>\<open>conj for _ _\<close>\<close>) =>
+  (case Thm.concl_of th of
+    \<^Const_>\<open>Trueprop for \<^Const_>\<open>conj for _ _\<close>\<close> =>
       open_fact (th RS @{thm conjunct1}) @ open_fact (th RS @{thm conjunct2})
-  | (true, \<^Const_>\<open>Trueprop for \<^Const_>\<open>All _ for _\<close>\<close>) => open_fact (th RS @{thm spec})
+  | \<^Const_>\<open>Trueprop for \<^Const_>\<open>All _ for _\<close>\<close> => open_fact (th RS @{thm spec})
   | _ => [Conv.fconv_rule Drule.beta_eta_conversion th]);
 
-(*what a part is to the traversal.  Concept_Fact: C t without premises.  Rule: C t under
-  premises; it goes into the table, strengthened, as an unsafe entry, and nothing more is done
-  with it.  Relation: a proposition R ts of HOL that is no concept fact, for a constant R,
-  given without Trueprop*)
-datatype leaf = Concept_Fact of Form.fact | Rule of Form.fact | Relation of term | Nothing;
+(*what a part is to the traversal, read off its conclusion; its premises are carried along
+  and never taken apart.  Concept_Fact: the conclusion is C t.  Relation: the conclusion is a
+  proposition R ts of HOL that is no concept fact, for a constant R, given without Trueprop*)
+datatype leaf = Concept_Fact of Form.fact | Relation of term | Nothing;
 
 fun leaf_of ctxt th =
   (case Form.of_thm ctxt th of
     SOME fact =>
-      if is_some (schematic_head (Form.conclusion fact)) then Nothing
-      else if Thm.no_prems th then Concept_Fact fact
-      else Rule fact
+      if is_some (schematic_head (Form.conclusion fact)) then Nothing else Concept_Fact fact
   | NONE =>
-      (case Thm.prop_of th of
+      (case Thm.concl_of th of
         \<^Const_>\<open>Trueprop for A\<close> => if is_Const (Term.head_of A) then Relation A else Nothing
       | _ => Nothing));
 
 (*the key of a part in the set and among the propositions taken apart*)
-fun leaf_key th (Concept_Fact fact) = fact_key fact
+fun leaf_key th (Concept_Fact fact) = entry_prop fact
   | leaf_key th _ = canonical (Thm.prop_of th);
 
 (*the conditions of the instance that makes a structure, as theorems of concept u, where u is
@@ -1515,7 +1594,6 @@ type node =
   record: Concept_Check.record,
   chain: term list,      (*the entries of the concept facts on its chain, across activations*)
   inherited: Termset.T,  (*the names of the piece to whose continuation it belongs*)
-  mask: (Proof.context -> bool) option,
   table: int,            (*its table of propositions taken apart*)
   second: bool,          (*in the second pass*)
   derived: bool,         (*by a rule or from an instance*)
@@ -1523,11 +1601,11 @@ type node =
   root: bool};           (*the fact that came in*)
 
 fun in_second_pass
-    ({id, parent, thm, leaf, key, record, chain, inherited, mask, table, derived, stated, root,
+    ({id, parent, thm, leaf, key, record, chain, inherited, table, derived, stated, root,
       ...}: node) : node =
   {id = id, parent = parent, thm = thm, leaf = leaf, key = key, record = record, chain = chain,
-   inherited = inherited, mask = mask, table = table, second = true, derived = derived,
-   stated = stated, root = root};
+   inherited = inherited, table = table, second = true, derived = derived, stated = stated,
+   root = root};
 
 (*what waits for the end of a round*)
 datatype scheduled =
@@ -1540,11 +1618,18 @@ datatype scheduled =
 (*The fact root, in beta-eta normal form and without outer quantifiers, is taken apart in ctxt0.
   limit: of its count, none where the site has none.  two_groups: what the first pass does with
   a relation fact that contains two earlier facts of its chain; with Refused there is no second
-  pass.  recorder: the key of the fact.  It gives the new context, the entries put, and whether
+  pass.  recorder: the key of the fact.  own_variables: the variables of a rule that is
+  registered in a theory, fixed for this traversal; a fact on such a variable is put and not
+  activated: where the rule is used the variable is schematic, and a proof that has the same
+  theorem makes nothing of such a fact.  It gives the new context, the entries put, and whether
   the limit has left work below the fact (4A.4)*)
-fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
+fun traverse {limit, two_groups, safe_intro, mask, recorder, own_variables} root ctxt0 =
   let
     val thy = Proof_Context.theory_of ctxt0;
+    fun on_own_variable fact =
+      (case Term.head_of (Form.inner (Form.conclusion fact)) of
+        Free (x, _) => member (op =) own_variables x
+      | _ => false);
     val reading: Concept_Check.reading =
      {fixed = Variable.is_fixed ctxt0,
       concept_name =
@@ -1613,14 +1698,13 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
 
     (* nodes *)
 
-    fun make {parent, record, chain, inherited, mask, table, second, derived, stated, root}
+    fun make {parent, record, chain, inherited, table, second, derived, stated, root}
         (th, leaf) =
       let
         val nd: node =
          {id = Unsynchronized.inc ids, parent = parent, thm = th, leaf = leaf,
           key = leaf_key th leaf, record = record, chain = chain, inherited = inherited,
-          mask = mask, table = table, second = second, derived = derived, stated = stated,
-          root = root};
+          table = table, second = second, derived = derived, stated = stated, root = root};
       in
         Unsynchronized.change nodes (cons nd);
         Unsynchronized.change parents (Inttab.update (#id nd, parent));
@@ -1631,15 +1715,15 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
     fun child (nd: node) record chain part =
       make
        {parent = SOME (#id nd), record = record, chain = chain, inherited = #inherited nd,
-        mask = #mask nd, table = #table nd, second = #second nd, derived = true, stated = false,
-        root = false} part;
+        table = #table nd, second = #second nd, derived = true, stated = false, root = false}
+        part;
 
     (*a concept fact that a rule or an instance gives counts where it appears first in its
       table, unless the set lets it pass (4A.3)*)
     fun count_derived (nd: node) =
       (case #leaf nd of
         Concept_Fact fact =>
-          if has_appeared nd orelse is_some (status_of (! context) fact) then ()
+          if has_appeared nd orelse is_some (status_of (! context) mask fact) then ()
           else (appear nd; ignore (Unsynchronized.inc count))
       | _ => ());
 
@@ -1672,7 +1756,7 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
     fun meet (nd: node) entry =
       let
         val pieces =
-          stopped_work (! context) |> filter (fn piece =>
+          #stopped (Destruction.get (! context)) |> filter (fn piece =>
             Termset.member (#names piece) entry andalso not (member same_stopped (! met) piece));
       in
         Unsynchronized.change meetings (cons (entry, entry :: #chain nd));
@@ -1683,20 +1767,14 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
              (cons (Continue {pieces = pieces, at = nd, entry = entry})))
       end;
 
-    (*the step of a fact into the table: it is strengthened, and each entry is put unless
-      the table has it; each with whether it is new*)
-    fun put_entries (nd: node) (fact, safety) =
-      strengthened (! context) (fact, safety) |> map (fn (fact', safety') =>
-        let
-          val registration: registration =
-            {fact = fact', user = false, safety = safety', mask = #mask nd,
-             pos = Position.none};
-          val (new, ctxt) = add_contextual registration (! context);
-        in
-          context := ctxt;
-          if new then Unsynchronized.change put (cons registration) else ();
-          (fact', new)
-        end);
+    (*the step of a fact into the table; each entry with whether it is new*)
+    fun put_entries fact =
+      let val (results, ctxt) = put_strengthened mask fact (! context) in
+        context := ctxt;
+        results |> List.app (fn (registration, new) =>
+          if new then Unsynchronized.change put (cons registration) else ());
+        map (fn (registration: registration, new) => (#fact registration, new)) results
+      end;
 
     fun set_entries ({id, ...}: node) facts =
       Unsynchronized.change entries (Inttab.update (id, map entry_prop facts));
@@ -1736,7 +1814,7 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
       parts nd fact (go_on nd First (adding (check_fact fact))) (entries_at nd @ #chain nd);
 
     fun visit_fact (nd: node) fact =
-      (case if #root nd then NONE else status_of (! context) fact of
+      (case if #root nd then NONE else status_of (! context) mask fact of
         SOME (Capped _) =>
           (*passed over, but it meets its entries*)
           let val own = entries_of (! context) fact in
@@ -1754,20 +1832,22 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
               if instance andalso is_none first then SOME (check_fact fact (#record nd)) else NONE;
             (*what its activation results carry: the fact is in it where it passed the check*)
             val record = (case verdict of SOME (Concept_Check.Passes r) => r | _ => #record nd);
-            val results = put_entries nd (fact, Safe_By_System);
+            val results = put_entries fact;
             val _ = set_entries nd (map #1 results);
             val chain = entries_at nd @ #chain nd;
             val _ = results |> List.app (fn (fact', new) =>
-              if new then
+              if not new then meet nd (entry_prop fact')
+              else if on_own_variable fact' then ()
+              else
                 Unsynchronized.change entered
-                  (cons {fact = fact', node = nd, record = record, chain = chain})
-              else meet nd (entry_prop fact'));
+                  (cons {fact = fact', node = nd, record = record, chain = chain}));
             val _ =
               if safe_intro then
                 context :=
                   Classical.addSIs (! context,
-                    distinct Thm.eq_thm_prop
-                      (Form.thm_of fact :: map (Form.thm_of o #1) (filter #2 results)))
+                    filter Thm.no_prems
+                      (distinct Thm.eq_thm_prop
+                        (Form.thm_of fact :: map (Form.thm_of o #1) (filter #2 results))))
               else ();
           in
             (case (first, verdict) of
@@ -1793,9 +1873,7 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
               val products =
                 open_fact (elim_first ctxt rule (#thm nd)) |> map (fn th => (th, leaf_of ctxt th));
               val variable =
-                (case Thm.concl_of rule of
-                  \<^Const_>\<open>Trueprop for B\<close> => is_Var (Term.head_of B)
-                | B => is_Var (Term.head_of B));
+                is_Var (Term.head_of (HOLogic.dest_Trueprop (Thm.concl_of rule)));
             in
               if variable then filter (fn (_, Concept_Fact _) => true | _ => false) products
               else products
@@ -1804,7 +1882,7 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
       in List.app count_derived children; children end;
 
     fun visit_relation (nd: node) A =
-      (case extractions_for thy (Thm.prop_of (#thm nd)) of
+      (case extractions_for thy (Thm.concl_of (#thm nd)) of
         [] => []
       | rules =>
           (case taken_by nd First of
@@ -1829,7 +1907,6 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
     fun visit (nd: node) =
       (case #leaf nd of
         Concept_Fact fact => visit_fact nd fact
-      | Rule fact => (ignore (put_entries nd (fact, Unsafe)); [])
       | Relation A => visit_relation nd A
       | Nothing => []);
 
@@ -1857,11 +1934,11 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
                 val rn =
                   make
                    {parent = NONE, record = record, chain = chain, inherited = #inherited nd,
-                    mask = #mask nd, table = #table nd, second = #second nd, derived = false,
-                    stated = false, root = false} (th, Concept_Fact result);
+                    table = #table nd, second = #second nd, derived = false, stated = false,
+                    root = false} (th, Concept_Fact result);
                 val first = not (has_appeared rn);
                 val _ = appear rn;
-                val results = put_entries rn (result, Safe_By_System);
+                val results = put_entries result;
                 val _ = set_entries rn (map #1 results);
                 val _ = results |> List.app (fn (fact', new) =>
                   if new then () else meet rn (entry_prop fact'));
@@ -1886,7 +1963,6 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
                     (cons (Result {node = rn, work = work, first = first}))
                 else ()
               end
-          | Rule result => ignore (put_entries nd (result, Unsafe))
           | _ => ())
         end);
 
@@ -1948,15 +2024,15 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
       at once*)
     fun continue {pieces, at = nd: node, entry} =
       let
-        fun redo ({step, record, names, mask, ...}: stopped) =
+        fun redo ({step, record, names, ...}: stopped) =
           let
             val ctxt = ! context;
             val table = Unsynchronized.inc ids;
             fun node part =
               make
                {parent = NONE, record = record, chain = entry :: #chain nd, inherited = names,
-                mask = mask, table = table, second = #second nd, derived = false,
-                stated = false, root = false} part;
+                table = table, second = #second nd, derived = false, stated = false,
+                root = false} part;
             (*the node of a concept fact, which has appeared in its table*)
             fun fact_node fact =
               let val c = node (Form.thm_of fact, Concept_Fact fact) in
@@ -1967,8 +2043,8 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
           in
             (case step of
               Apply_Rules th =>
-                let val A = HOLogic.dest_Trueprop (Thm.prop_of th) in
-                  apply_rules (node (th, Relation A)) A (extractions_for thy (Thm.prop_of th))
+                let val A = HOLogic.dest_Trueprop (Thm.concl_of th) in
+                  apply_rules (node (th, Relation A)) A (extractions_for thy (Thm.concl_of th))
                 end
             | Take_Apart fact => take_apart (fact_node fact) fact
             | Further_Work work =>
@@ -2057,7 +2133,7 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
     fun stated parent is_root part =
       make
        {parent = parent, record = Concept_Check.empty, chain = [], inherited = Termset.empty,
-        mask = mask, table = 0, second = false, derived = false, stated = true, root = is_root}
+        table = 0, second = false, derived = false, stated = true, root = is_root}
         part;
     val opened = open_fact root;
     val single = (case opened of [th] => Thm.eq_thm_prop (th, root) | _ => false);
@@ -2100,7 +2176,7 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
       end;
     val stopped =
       refused |> map (fn (nd, step) =>
-        {step = step, record = #record nd, recorder = recorder, mask = #mask nd,
+        {step = step, record = #record nd, recorder = recorder,
          names = Termset.merge (Termset.make (entries_at nd @ #chain nd), #inherited nd)}: stopped)
       |> (fn pieces => fold record_piece pieces (#stopped (Destruction.get ctxt1)))
       |> close;
@@ -2137,7 +2213,9 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
     val ctxt2 =
       ctxt1 |> Destruction.map (fn {seen, ...} =>
         {seen =
-           fold (fn nd: node => Termtab.default (#key nd, Not_Capped))
+           fold (fn nd: node => fn seen' =>
+               if is_some (noted ctxt1 mask seen' (#key nd)) then seen'
+               else add_note mask (#key nd, Not_Capped) seen')
              (filter complete all_nodes) seen,
          stopped = filter_out (Termset.is_empty o #names) stopped});
 
@@ -2175,9 +2253,9 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder} root ctxt0 =
   is passed over.  In a context, a fact capped at a limit below the present one is taken
   apart again on what its context had before, at the present limit, and the outcome is merged
   into the context of now (4A.5).  It gives the entries put*)
-fun destruct_fact ({safe_intro, masked_entries, ...}: destruct_work) site th0 ctxt =
+fun destruct_fact own_variables ({safe_intro, masked_entries, ...}: destruct_work) site th0 ctxt =
   let
-    val th = Conv.fconv_rule Drule.beta_eta_conversion (Variable.gen_all ctxt th0);
+    val th = normal ctxt th0;
     val leaf = leaf_of ctxt th;
     val key = leaf_key th leaf;
     val show = Syntax.string_of_term ctxt;
@@ -2186,16 +2264,13 @@ fun destruct_fact ({safe_intro, masked_entries, ...}: destruct_work) site th0 ct
         Theory_Level => NONE
       | Host_Premise => SOME 50
       | _ => SOME (Config.get ctxt extraction_limit));
+    val mask = if masked_entries then SOME (mask_of th0) else NONE;
     fun traversal safe =
       traverse
        {limit = limit,
         two_groups = if site = Internal_Call then Concept_Check.Refused else Concept_Check.Aside,
-        safe_intro = safe,
-        mask =
-          if masked_entries then SOME (fn ctxt' => Raw_Simplifier.simproc_can_use_thm ctxt' th0)
-          else NONE,
-        recorder = key} th;
-    fun set_status status = map_seen (Termtab.update (key, status));
+        safe_intro = safe, mask = mask, recorder = key, own_variables = own_variables} th;
+    fun set_status status = map_seen (add_note mask (key, status));
 
     fun first ctxt' =
       let
@@ -2212,8 +2287,8 @@ fun destruct_fact ({safe_intro, masked_entries, ...}: destruct_work) site th0 ct
     fun again {entries, seen, stopped} n ctxt' =
       let
         val {context = private, put, capped} =
-          traversal false
-            (ctxt' |> put_contextual_part entries
+          traversal safe_intro
+            (ctxt' |> Context_Position.set_visible false |> put_contextual_part entries
               |> Destruction.put {seen = seen, stopped = stopped});
         val stopped' = #stopped (Destruction.get private);
         val recorded = filter_out (member same_stopped stopped) stopped';
@@ -2235,6 +2310,8 @@ fun destruct_fact ({safe_intro, masked_entries, ...}: destruct_work) site th0 ct
         (put,
          ctxt'
          |> fold (#2 oo add_contextual) put
+         (*the introduction rules of the traversal, which meets again those that are there*)
+         |> safe_intro ? Classical.put_claset (Classical.claset_of private)
          |> map_stopped merge
          |> set_status
             (if capped then
@@ -2243,8 +2320,8 @@ fun destruct_fact ({safe_intro, masked_entries, ...}: destruct_work) site th0 ct
       end;
     val status =
       (case leaf of
-        Concept_Fact fact => status_of ctxt fact
-      | _ => Termtab.lookup (#seen (Destruction.get ctxt)) key);
+        Concept_Fact fact => status_of ctxt mask fact
+      | _ => noted ctxt mask (#seen (Destruction.get ctxt)) key);
   in
     (case (status, site, limit) of
       (NONE, _, _) => first ctxt
@@ -2264,23 +2341,45 @@ fun destruct_fact ({safe_intro, masked_entries, ...}: destruct_work) site th0 ct
     | _ => ([], ctxt))
   end;
 
-(*An internal call starts without stopped work; the context that it gives back holds what
-  the call recorded and not the outer work, and its caller drops it.  Where there is no limit
-  the set starts empty, and that of the context is the same afterwards*)
-fun destruct_facts work site ths ctxt =
-  let
-    val outer = Destruction.get ctxt;
-    val start =
-      (case site of
-        Internal_Call => map_stopped (K [])
-      | Theory_Level => map_seen (K Termtab.empty)
-      | _ => I);
-    val finish = (case site of Theory_Level => map_seen (K (#seen outer)) | _ => I);
-  in
-    ctxt |> start |> fold_map (destruct_fact work site) ths |>> flat ||> finish
-  end;
+(*f where the hypotheses of th0 are premises of the simplifier in force, as wherever what f
+  writes for th0 is read; the simpset of the context is put back*)
+fun with_premise th0 f ctxt =
+  ctxt
+  |> Simplifier.add_prems (map Thm.assume (Thm.chyps_of th0))
+  |> f
+  ||> Simplifier.put_simpset (Simplifier.simpset_of ctxt);
 
-fun destruct_assms work site ths = #2 o destruct_facts work site ths;
+(*An internal call without masks starts without stopped work; the context that it gives back
+  holds what the call recorded and not the outer work, and its caller drops it.  A call with
+  masks, that of the handler of simp, takes each theorem apart where its premise is in force,
+  starting without stopped work and leaving that of the context as it was: what the limit
+  stops under a premise is not continued.  Where there is no limit the set starts empty, and
+  that of the context is the same afterwards*)
+fun destruct_facts own_variables (work as {masked_entries, ...}: destruct_work) site ths ctxt =
+  if masked_entries then
+    let
+      fun one th ctxt' =
+        let val {stopped, ...} = Destruction.get ctxt' in
+          ctxt'
+          |> map_stopped (K [])
+          |> with_premise th (destruct_fact own_variables work site th)
+          ||> map_stopped (K stopped)
+        end;
+    in fold_map one ths ctxt |>> flat end
+  else
+    let
+      val outer = Destruction.get ctxt;
+      val start =
+        (case site of
+          Internal_Call => map_stopped (K [])
+        | Theory_Level => map_seen (K Termtab.empty)
+        | _ => I);
+      val finish = (case site of Theory_Level => map_seen (K (#seen outer)) | _ => I);
+    in
+      ctxt |> start |> fold_map (destruct_fact own_variables work site) ths |>> flat ||> finish
+    end;
+
+fun destruct_assms work site ths = #2 o destruct_facts [] work site ths;
 
 
 (* the activation list of a concept *)
@@ -2299,12 +2398,12 @@ fun declare_activation name thy =
         [Thm.cterm_of ctxt0 (HOLogic.mk_Trueprop (Concept_Package.holds name S))] ctxt0;
     val statements = map (fn {kind, rule, ...} => (kind, elim_first ctxt rule holds)) components;
     val facts =
-      destruct_facts {safe_intro = false, notation = false, masked_entries = false} Theory_Level
-        (holds :: map #2 statements) ctxt
+      destruct_facts [] {safe_intro = false, notation = false, masked_entries = false}
+        Theory_Level (holds :: map #2 statements) ctxt
       |> #1 |> map #fact;
     val views =
       statements |> map_filter (fn (Concept_Package.View _, th) =>
-          Option.map fact_key (Form.of_thm ctxt th)
+          Option.map entry_prop (Form.of_thm ctxt th)
         | _ => NONE);
     fun plain fact = Thm.no_prems (Form.thm_of fact);
     fun on_structure fact fact' =
@@ -2324,7 +2423,7 @@ fun declare_activation name thy =
       facts
       |> filter_out (fn fact =>
           plain fact andalso
-          (given fact orelse member (op aconv) views (fact_key fact) orelse covered fact))
+          (given fact orelse member (op aconv) views (entry_prop fact) orelse covered fact))
       |> map Form.thm_of
       |> Proof_Context.export ctxt (Proof_Context.init_global thy)
       |> map (Thm.trim_context o Drule.zero_var_indexes);
@@ -2332,5 +2431,272 @@ fun declare_activation name thy =
 
 val _ =
   Theory.setup (Context.theory_map (Concept_Package.Declared.add 0 declare_activation));
+
+
+(* what a declaration puts into the table *)
+
+val plain = {safe_intro = false, notation = false, masked_entries = false};
+
+(*The conclusion of th as a fact of a context made from ctxt: its term and type variables fixed;
+  a premise concept u discharged where the hidden field of u is literally True, every other
+  premise assumed and not noted, so that it is not taken apart*)
+fun fact_context ctxt th =
+  let
+    val thy = Proof_Context.theory_of ctxt;
+    val base = Concept_Type.base_name thy;
+    val ((_, [th1]), ctxt1) = Variable.import true [Thm.transfer thy th] ctxt;
+    fun held (\<^Const_>\<open>Trueprop for \<open>Const (c, _) $ u\<close>\<close>) =
+          if c = base then Concept_Type.concept_holds ctxt1 u else NONE
+      | held _ = NONE;
+    val prems = Thm.prems_of th1;
+    val assumptions = map (Thm.cterm_of ctxt1) (filter (is_none o held) prems);
+    val ctxt2 = #2 (Assumption.add_assumes assumptions ctxt1);
+    (*each assumption as the premise states it, not in the form of a fact of the context*)
+    val assumed = map Thm.assume assumptions;
+    fun proofs [] _ = []
+      | proofs (p :: ps) hs =
+          (case held p of SOME h => h :: proofs ps hs | NONE => hd hs :: proofs ps (tl hs));
+  in (Drule.implies_elim_list th1 (proofs prems assumed), ctxt2) end;
+
+(*the mark of an entry that a declaration stores without a mark given.  It stands in for the
+  judgment at a declaration (2.3 of the search plan), which is not written*)
+fun stored_safety th = if Thm.no_prems th then Safe_By_System else Unsafe;
+
+(*What goes into the table of the theory with th, beside the entries of th itself: everything
+  that th puts when it is taken apart in its fact_context, exported, with the premises of th.
+  Left out: what th itself puts, which its declaration gives with its own marks; an entry
+  whose structure is a schematic variable*)
+fun activation_entries thy th =
+  let
+    val outer = Proof_Context.init_global thy;
+    val (fact, ctxt) = fact_context outer th;
+    val own = (case Form.of_thm ctxt fact of SOME f => entries_of ctxt f | NONE => []);
+    val variables = Thm.fold_terms {hyps = true} Term.add_free_names fact [];
+    val (put, ctxt') = destruct_facts variables plain Theory_Level [fact] ctxt;
+  in
+    put
+    |> filter_out (fn {fact = f, ...}: registration => member (op aconv) own (entry_prop f))
+    |> map (Form.thm_of o #fact)
+    |> Proof_Context.export ctxt' outer
+    |> map_filter (Form.of_thm outer o Drule.zero_var_indexes)
+    |> filter (is_none o schematic_head o Form.conclusion)
+    |> map (fn f =>
+        {fact = f, user = false, safety = stored_safety (Form.thm_of f), mask = NONE,
+         pos = Position.none}: registration)
+  end;
+
+type marks = {user: bool, safety: safety, pos: Position.T};
+
+(*the entries of a rule itself, strengthened, with the marks of its declaration*)
+fun own_entries ctxt ({user, safety, pos}: marks) fact =
+  strengthened ctxt (fact, safety)
+  |> map (fn (f, s) => {fact = f, user = user, safety = s, mask = NONE, pos = pos}: registration);
+
+(*a rule in a theory: its own entries, and what it gives when it is taken apart; all computed
+  on the theory that does not have the rule*)
+fun rule_entries marks th thy =
+  let val ctxt = Proof_Context.init_global thy in
+    own_entries ctxt marks (the (Form.of_thm ctxt th)) @ activation_entries thy th
+  end;
+
+(*the rules of an import, or the fact of a view: one writing for all of them.  Without a mark
+  given, a rule without premises is safe and one with premises unsafe*)
+fun add_system_entries rules =
+  register_theory (fn thy =>
+    rules |> maps (fn {rule, safety} =>
+      rule_entries
+       {user = false, pos = Position.none,
+        safety = the_default (stored_safety rule) safety} rule thy));
+
+(*an instance: its rule goes in as it is, safe, and is not taken apart as a rule; its theorem
+  from concept t to the declared concept is taken apart*)
+fun add_instance_entries {rule, theorem} =
+  register_theory (fn thy =>
+    let val ctxt = Proof_Context.init_global thy in
+      own_entries ctxt {user = false, safety = Safe_By_System, pos = Position.none}
+        (the (Form.of_thm ctxt rule)) @
+      activation_entries thy theorem
+    end);
+
+(*a fact that comes into a context: it is taken apart there, and each concept fact of its first
+  stage that has no premises is a safe introduction rule of the context*)
+fun take_in th =
+  destruct_assms {safe_intro = true, notation = false, masked_entries = false} In_Context [th];
+
+(*pos: where the attribute stands.  In a proof, and on an assumption of a statement, the
+  attribute runs before the function on the indexed facts: it takes the rule in itself, and
+  then puts the entries of the rule with the marks of the declaration.  Put first, they would
+  hide the rule from what takes it apart*)
+fun register_rule {safe} pos th context =
+  if on_level context then context
+  else
+    let
+      val fact = check_rule (Context.proof_of context) th;
+      val marks = {user = true, safety = if safe then Safe_By_User else Unsafe, pos = pos};
+    in
+      (case context of
+        Context.Theory thy => Context.Theory (register_theory (rule_entries marks th) thy)
+      | Context.Proof ctxt =>
+          let val ctxt' = take_in th ctxt in
+            Context.Proof (fold (#2 oo add_contextual) (own_entries ctxt' marks fact) ctxt')
+          end)
+    end;
+
+(*the attribute is defined on its whole source, which has the position of its name; Attrib.setup
+  hands over the arguments alone*)
+val _ =
+  Theory.setup
+    (Attrib.define_global \<^binding>\<open>concept_intro\<close>
+      (fn src =>
+        Attrib.attribute_syntax
+          (Scan.lift (Scan.optional (Args.bang >> K true) false) >> (fn safe =>
+            Thm.declaration_attribute
+              (register_rule {safe = safe} (#2 (Token.name_of_src src))))) src)
+      "declaring an introduction rule, used to prove that a structure is a concept" #> #2);
+
+
+(* the facts that a context indexes *)
+
+(*Proof_Context.Indexed_Facts hands over each fact that a context indexes by its proposition:
+  the facts of a proof, the assumptions and notes of a statement or of an unnamed context, and
+  what a block exports.  A theorem of the theory or of a level of a local theory is not
+  indexed; it enters by [concept_intro]*)
+
+(*whether assumption destruction may take something from a proposition, read without
+  inference: it may say yes in vain, never no where there is work.  It reads the conclusion as
+  the traversal does: through the conjunctions and universal quantifications that open_fact
+  opens, a concept fact, or a proposition that an extraction rule takes.  Where the conclusion
+  of that rule has a variable at its head, as in the rules that open an implication or a
+  bounded quantification, what the rule takes out is read in turn, to a depth*)
+fun has_work thy prop =
+  let
+    val rules = Extractions.get thy;
+    (*the conclusion below the parameters and premises, the parameters as free variables*)
+    fun hhf_concl t =
+      Term.subst_bounds (rev (map Free (Logic.strip_params t)), Logic.strip_assums_concl t);
+    (*what a rule takes out of P, with whether the head of its conclusion is a variable*)
+    fun taken_out P ({rule, ...}: extraction) =
+      let
+        val (prem, rest) =
+          Logic.dest_implies
+            (Logic.incr_indexes ([], Term.maxidx_of_term P + 1) (Thm.prop_of rule));
+      in
+        (case (hhf_concl rest, try (Pattern.match thy (prem, P)) (Vartab.empty, Vartab.empty)) of
+          (concl as \<^Const_>\<open>Trueprop for B\<close>, SOME env) =>
+            SOME (is_Var (Term.head_of B), Envir.beta_norm (Envir.subst_term env concl))
+        | _ => NONE)
+      end;
+    fun part depth \<^Const_>\<open>conj for A B\<close> = part depth A orelse part depth B
+      | part depth \<^Const_>\<open>All T for P\<close> = part depth (Term.betapply (P, Free ("x", T)))
+      | part depth A =
+          let val P = HOLogic.mk_Trueprop A in
+            is_some (dest_fact thy P) orelse
+            Item_Net.retrieve_matching rules P |> exists (fn rule =>
+              (case taken_out P rule of
+                NONE => false
+              | SOME (true, \<^Const_>\<open>Trueprop for B\<close>) => depth = 0 orelse part (depth - 1) B
+              | SOME _ => true))
+          end;
+  in
+    (case hhf_concl (Envir.beta_eta_contract prop) of
+      \<^Const_>\<open>Trueprop for A\<close> => part 10 A
+    | _ => false)
+  end;
+
+(*each theorem on its own; one that assumption destruction cannot take is passed over, so
+  that no error of it reaches the proof of the user*)
+fun take_facts ths ctxt =
+  fold (fn th => fn ctxt' =>
+      (case Exn.result (take_in th) ctxt' of
+        Exn.Res ctxt'' => ctxt''
+      | Exn.Exn exn =>
+          if Exn.is_interrupt exn then Exn.reraise exn
+          else
+            (if Config.get ctxt' extraction_trace then
+              tracing ("concept: the fact " ^ Thm.string_of_thm ctxt' th ^
+                " is not taken apart:\n" ^ Runtime.exn_message exn)
+             else ();
+             ctxt')))
+    ths ctxt;
+
+(*the facts of a statement that were kept while auto_concept_extraction was off, the latest
+  first*)
+structure Kept = Proof_Data
+(
+  type T = thm list;
+  fun init _ = [];
+);
+
+val auto_extraction =
+  Attrib.setup_config_bool \<^binding>\<open>auto_concept_extraction\<close> (K true);
+
+(*what was kept, taken apart now in the order it came.  Nothing stays kept: a second call does
+  nothing.  For a state whose goal was stated with the option off: on the context of the goal,
+  before the first step of the proof*)
+fun concept_extract ctxt =
+  (case Kept.get ctxt of
+    [] => ctxt
+  | ths => ctxt |> Kept.put [] |> take_facts (rev ths));
+
+(*A theorem marked as handled is passed over, as is one without work.  A fact of a proof body
+  is taken apart at once.  A fact of a statement is too, unless auto_concept_extraction is off:
+  then it is kept for concept_extract*)
+fun take_indexed ths ctxt =
+  let
+    val thy = Proof_Context.theory_of ctxt;
+    val ths' = filter (fn th => not (is_handled th) andalso has_work thy (Thm.prop_of th)) ths;
+  in
+    if null ths' then ctxt
+    else if Variable.is_body ctxt orelse Config.get ctxt auto_extraction then take_facts ths' ctxt
+    else Kept.map (fold cons ths') ctxt
+  end;
+
+val _ = Theory.setup (Context.theory_map (Proof_Context.Indexed_Facts.add 0 take_indexed));
+
+
+(* the premises that the simplifier assumes *)
+
+(*Inside the selector Simpset (4A.6): a concept fact is strengthened and put with the mask of
+  its premise, where the premise is in force; nothing is taken apart or activated, and a
+  premise of another kind gives nothing*)
+fun put_premise th0 =
+  #2 o with_premise th0 (fn ctxt =>
+    ((),
+     (case leaf_of ctxt (normal ctxt th0) of
+       Concept_Fact fact => #2 (put_strengthened (SOME (mask_of th0)) fact ctxt)
+     | _ => ctxt)));
+
+(*The handler of simp.  It gets a theorem with hypotheses: a part of a premise that the
+  simplifier assumes, as the handlers of HOL have split it, or a rule that the user gives in a
+  proof and that depends on an assumption.  It is taken apart with the mask of its hypotheses
+  (inside the selector Simpset it is only put), and the rules that the simplifier makes of it by default are kept; for a rule of the user the
+  simplifier drops what the handler did to the context, and the fact is mostly known already.
+  A theorem without hypotheses, and one without work, is passed over: the simplifier goes on as
+  without the handler*)
+fun simp_handler ctxt th =
+  if null (Thm.hyps_of th) orelse not (has_work (Proof_Context.theory_of ctxt) (Thm.prop_of th))
+  then NONE
+  else
+    let
+      val ctxt' =
+        if Concept_Type.in_selector_simp ctxt then put_premise th ctxt
+        else
+          destruct_assms {safe_intro = false, notation = false, masked_entries = true}
+            Internal_Call [th] ctxt;
+    in SOME (Simplifier.get_mksimps_context ctxt' th ctxt') end;
+
+val _ =
+  Theory.setup (fn thy =>
+    let
+      val add =
+        Simplifier.add_mksimps_handler ("concept",
+          Simplifier.make_mksimps_handler
+           {patterns = [HOLogic.mk_Trueprop (Free ("P", HOLogic.boolT))], priority = ~1,
+            kept_by_clear_simpset = false, handler = simp_handler});
+    in
+      thy
+      |> Simplifier.map_theory_simpset add
+      |> Context.theory_map (Concept_Type.map_selector_simpset add)
+    end);
 
 end;
