@@ -813,12 +813,20 @@ fun target name : Named_Target.other_target =
     val cname = Long_Name.base_name name;
     fun fixes S = let val (s, T) = dest_Free S in [(Binding.name s, SOME T, NoSyn)] end;
     fun setup thy =
-      let val {S, axiom, assumption} = elements thy name in
-        Proof_Context.init_global thy
-        |> Variable.declare_term S
-        |> Proof_Context.add_fixes (fixes S) |> #2
+      let
+        val {S, axiom, assumption} = elements thy name;
+        val ctxt =
+          Proof_Context.init_global thy
+          |> Variable.declare_term S
+          |> Proof_Context.add_fixes (fixes S) |> #2;
+      in
+        (*the assumption is a fact of a statement, as in a context with assumes: indexed by
+          its proposition*)
+        ctxt
+        |> Proof_Context.set_stmt true
         |> Proof_Context.add_assms Assumption.assume_export
             [((axiom, [Classical.safe_intro NONE]), [(assumption, [])])] |> #2
+        |> Proof_Context.restore_stmt ctxt
         |> Proof_Context.put_default_fact_qualifiers (qualifiers thy name)
         |> Config.put Local_Theory.global_form_enabled true
       end;
