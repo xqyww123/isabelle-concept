@@ -922,7 +922,7 @@ val trace = Attrib.setup_config_bool \<^binding>\<open>concept_fact_trace\<close
   concept_fact_trace says so, with what it was simplifying;
   each unit says what it then gives.  Nested units count on the bounds around them too; with
   one bound everywhere a nested unit never gives NONE: the outermost unit stops*)
-val step_bound = 1000;
+val step_bound = 150;
 
 (*State outside the units that work inside a unit changes.  It is put back where a unit does
   not give its result, so that such a unit leaves nothing behind: save is called before a unit;
