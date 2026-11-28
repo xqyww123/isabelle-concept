@@ -253,6 +253,7 @@ sig
   type entry = {concept: string, rule: thm, user: bool, safety: safety, pos: Position.T}
   val dest_fact: theory -> term -> (string * string * term) option
   val is_concept_premise: theory -> term -> bool
+  val canonical: term -> term
   type form
   val form_of_goal: Proof.context -> term -> form option
   val form_prop: form -> term
@@ -1108,15 +1109,13 @@ fun check_rule ctxt th =
       (case Form.of_thm ctxt th of
         SOME fact => fact
       | NONE =>
-          error ("Users are not allowed to declare a concept_intro rule whose conclusion \
-            \is not a concept fact. The conclusion of your " ^ print (Thm.prop_of th) ^
-            " must have the form \"concept_predicate structure\""));
+          error ("A concept_intro rule cannot have a conclusion that is not a concept fact. \
+            \The conclusion of your rule must have the form \"concept_predicate structure\""));
     val form = Form.conclusion fact;
     val _ =
       (case schematic_head form of
         SOME head =>
-          error ("Users are not allowed to declare a concept_intro rule whose conclusion is \
-            \about an arbitrary " ^
+          error ("A concept_intro rule cannot have a conclusion about an arbitrary " ^
             quote (Proof_Context.extern_const ctxt (Form.concept form)) ^
             " structure. The " ^ Syntax.string_of_term ctxt head ^ " in your " ^
             print (HOLogic.dest_Trueprop (Thm.concl_of th)) ^ " must not be a variable")
@@ -1202,20 +1201,19 @@ fun applied_variable t =
 in
 
 (*the shapes that a declaration refuses, in the texts that the owner approved.  The shape is
-  that of the rule in beta-eta normal form, th; the texts show the rule as the user wrote it*)
+  that of the rule in beta-eta normal form, th; the texts quote parts of the rule as the user
+  wrote it*)
 fun check_extraction ctxt written th =
   let
     val thy = Proof_Context.theory_of ctxt;
     val show = Syntax.string_of_term ctxt;
-    val rule = quote (show (Thm.prop_of written));
     val written_prem = quote (show (the_default Term.dummy (try hd (Thm.prems_of written))));
-    fun refuse what advice =
-      error ("Users are not allowed to declare a concept_extraction rule " ^ what ^ ". " ^ advice);
+    fun refuse what = error ("A concept_extraction rule " ^ what);
     val prems = Thm.prems_of th;
     val prem =
       (case prems of
         prem :: _ => prem
-      | [] => refuse "without a premise" ("Your " ^ rule ^ " must have at least one premise"));
+      | [] => refuse "must have at least one premise");
     (*how the texts name the premise that a proposition is matched against*)
     val premise = if length prems = 1 then "premise" else "first premise";
     val concl = Thm.concl_of th;
@@ -1224,65 +1222,61 @@ fun check_extraction ctxt written th =
       (case concl of
         \<^Const_>\<open>Trueprop for A\<close> => A
       | _ =>
-          refuse "whose conclusion is not a proposition of HOL"
-            ("The conclusion " ^ quote (show (Thm.concl_of written)) ^ " of your " ^ rule ^
-              " must be a proposition of HOL"));
+          refuse ("cannot have a conclusion that is not a proposition of HOL: " ^
+            quote (show (Thm.concl_of written))));
     fun split kind =
-      refuse ("whose " ^ premise ^ " is a " ^ kind)
-        ("The " ^ written_prem ^ " in your " ^ rule ^
-          " is split before any concept_extraction rule is tried");
+      refuse ("cannot have " ^ kind ^ " as its " ^ premise ^ ". The " ^ written_prem ^
+        " in your rule is split before any concept_extraction rule is tried");
     val _ =
       (case concl_body of
         \<^Const_>\<open>conj for _ _\<close> =>
-          refuse "whose conclusion is a conjunction"
-            ("Split your " ^ rule ^ " into one rule for each conjunct")
+          refuse "cannot have a conjunction as its conclusion. Split your rule into one rule \
+            \for each conjunct"
       | _ => ());
     val _ =
       if is_some (dest_fact thy prem) then
-        refuse ("whose " ^ premise ^ " is a concept fact")
-          ("The " ^ written_prem ^ " in your " ^ rule ^
-            " is taken apart by concept instances, not by concept_extraction rules")
+        refuse ("cannot have a concept fact as its " ^ premise ^ ". The " ^ written_prem ^
+          " in your rule is taken apart by concept instances")
       else ();
     val _ =
       (case body of
-        \<^Const_>\<open>conj for _ _\<close> => split "conjunction"
-      | \<^Const_>\<open>All _ for _\<close> => split "universal quantification"
-      | \<^Const_>\<open>Pure.all _ for _\<close> => split "universal quantification"
+        \<^Const_>\<open>conj for _ _\<close> => split "a conjunction"
+      | \<^Const_>\<open>All _ for _\<close> => split "a universal quantification"
+      | \<^Const_>\<open>Pure.all _ for _\<close> => split "a universal quantification"
       | _ => ());
     val _ =
       (case Term.head_of body of
         head as Var _ =>
-          refuse ("whose " ^ premise ^ " fits any proposition")
-            ("The " ^ show head ^ " in your " ^ rule ^ " must not be a variable")
+          refuse ("cannot have a " ^ premise ^ " that fits any proposition. The " ^ show head ^
+            " in your rule must not be a variable")
       | _ => ());
     val _ =
       (case applied_variable body of
         SOME (head, arg) =>
-          refuse ("whose " ^ premise ^ " applies a variable to a term")
-            ("The " ^ show head ^ " in your " ^ rule ^ " must not be applied to " ^
-              (if is_Var arg then show arg else quote (show arg)))
+          refuse ("cannot have a " ^ premise ^ " that applies a variable to a term. The " ^
+            show head ^ " in your rule must not be applied to " ^
+            (if is_Var arg then show arg else quote (show arg)))
       | NONE => ());
-    val prem_vars = Term.add_vars prem [];
-    val _ =
-      (case Term.head_of concl_body of
-        head as Var v =>
-          if member (op =) prem_vars v then ()
-          else
-            refuse "whose conclusion can never be a concept fact"
-              ("The " ^ show head ^ " in your " ^ rule ^ " must occur in the " ^ premise)
-      | _ => ());
     (*the further premises stay on what the rule takes out: a variable of the conclusion may
       come from any of them*)
     val _ =
       (case subtract (op =) (fold Term.add_vars prems []) (rev (Term.add_vars concl [])) of
         [] => ()
       | vars =>
-          refuse
-            ("whose conclusion has " ^ (if length vars = 1 then "a variable" else "variables") ^
-              " that its " ^
-              (if length prems = 1 then "premise does not have" else "premises do not have"))
-            ("The " ^ plural (map (show o Var) vars) ^ " in your " ^ rule ^
-              " must occur in " ^ (if length prems = 1 then "the premise" else "a premise")));
+          refuse ("cannot have a conclusion containing " ^
+            (if length vars = 1 then "a variable" else "variables") ^ " unconstrained in the " ^
+            (if length prems = 1 then "premise" else "premises") ^ ": " ^
+            plural (map (show o Var) vars)));
+    (*the variable at the head of the conclusion must come from the first premise, the only
+      one that is matched*)
+    val _ =
+      (case Term.head_of concl_body of
+        head as Var v =>
+          if member (op =) (Term.add_vars prem []) v then ()
+          else
+            refuse ("cannot have a conclusion starting with a variable unconstrained in the \
+              \first premise: " ^ show head)
+      | _ => ());
   in () end;
 
 end;
@@ -1860,8 +1854,7 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder, own_variables} root
             | _ => [])
           end);
 
-    (*the extraction rules on a relation fact, all of them in one step.  A conclusion with a
-      variable of its rule at the head is kept only where it has become a concept fact*)
+    (*the extraction rules on a relation fact, all of them in one step*)
     fun apply_rules (nd: node) A rules =
       let
         val ctxt = ! context;
@@ -1869,15 +1862,7 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder, own_variables} root
         val record' = go_on nd First (Concept_Check.after_rule o adding check);
         val children =
           rules |> maps (fn rule =>
-            let
-              val products =
-                open_fact (elim_first ctxt rule (#thm nd)) |> map (fn th => (th, leaf_of ctxt th));
-              val variable =
-                is_Var (Term.head_of (HOLogic.dest_Trueprop (Thm.concl_of rule)));
-            in
-              if variable then filter (fn (_, Concept_Fact _) => true | _ => false) products
-              else products
-            end)
+            open_fact (elim_first ctxt rule (#thm nd)) |> map (fn th => (th, leaf_of ctxt th)))
           |> map (child nd record' (#chain nd));
       in List.app count_derived children; children end;
 
@@ -2589,7 +2574,7 @@ fun has_work thy prop =
     fun part depth \<^Const_>\<open>conj for A B\<close> = part depth A orelse part depth B
       | part depth \<^Const_>\<open>All T for P\<close> = part depth (Term.betapply (P, Free ("x", T)))
       | part depth A =
-          let val P = HOLogic.mk_Trueprop A in
+          let val P = HOLogic.mk_Trueprop (Envir.beta_eta_contract A) in
             is_some (dest_fact thy P) orelse
             Item_Net.retrieve_matching rules P |> exists (fn rule =>
               (case taken_out P rule of
