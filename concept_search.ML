@@ -833,7 +833,7 @@ fun steps close ctxt names goal =
   | {form, ...} =>
       let
         val thy = Proof_Context.theory_of ctxt;
-        val (C, _, t) = the (Intro.dest_fact thy (Intro.form_prop form));
+        val C = Intro.form_concept form and t = Intro.form_structure_term form;
         fun premises [] _ = []
           | premises (prem :: prems) trying =
               if Intro.is_concept_premise thy prem then
@@ -945,8 +945,7 @@ fun tidy ctxt derivation =
             fun opened w (Kernel.Under (w', lit), th) =
                   if #same_wrapper read (w, w') then
                     [(lit,
-                      Thm.equal_elim
-                        (Thm.symmetric (formula_conv (cert (under_formula w' lit)))) th
+                      Intro.prop_of_formula ctxt' (fix (under_formula w' lit)) th
                       |> instance w')]
                   else []
               | opened _ _ = [];
@@ -963,11 +962,8 @@ fun tidy ctxt derivation =
                     (case (go_on (branch, Thm.assume cP), cases (Thm.assume cQ) rest go_on) of
                       (SOME th1, SOME th2) =>
                         SOME
-                          (Drule.implies_elim_list
-                            (Drule.infer_instantiate ctxt'
-                              [(("P", 0), cert P), (("Q", 0), cert Q),
-                               (("R", 0), Thm.dest_arg (Thm.cprop_of th1))] @{thm disjE})
-                            [th, Thm.implies_intr cP th1, Thm.implies_intr cQ th2])
+                          (Intro.disj_elim th (Thm.implies_intr cP th1)
+                            (Thm.implies_intr cQ th2))
                     | _ => NONE)
                   end
               | _ => go_on (the_single branches, th));

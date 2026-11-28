@@ -257,6 +257,8 @@ sig
   val canonical: term -> term
   type form
   val form_of_goal: Proof.context -> term -> form option
+  val form_concept: form -> string
+  val form_structure_term: form -> term
   val form_prop: form -> term
   val form_equation: form -> thm lazy option
   val entries_for: Proof.context -> form -> entry list
@@ -281,6 +283,8 @@ sig
   val conditions_of: derivation -> term
   val under: {params: (string * (string * typ)) list, hyps: term list} -> term -> term
   val map_derivation: (term -> term) -> (thm -> thm) -> derivation -> derivation
+  val prop_of_formula: Proof.context -> term -> thm -> thm
+  val disj_elim: thm -> thm -> thm -> thm
   val goal_thm: Proof.context -> derivation -> thm -> thm
   datatype failure = No_Plan | User_Limit | Not_Concept_Goal
   datatype 'a result = Found of {value: 'a, cut_short: bool} | Failed of failure
@@ -351,10 +355,6 @@ fun is_concept_premise thy prem =
     concludes_fact prem andalso not (exists concludes_fact (Logic.strip_assums_hyp prem))
   end;
 
-(*a structure term below the truncations at its head*)
-fun below thy t =
-  (case Concept_Type.dest_truncation thy t of SOME (_, u) => below thy u | NONE => t);
-
 
 
 (** the form of a concept fact **)
@@ -401,10 +401,10 @@ fun fixed_form ctxt (C, c, t) =
     val steps =
       map (Drule.arg_cong_rule (Thm.cterm_of ctxt (Term.head_of (Concept_Package.holds c t))))
         (rev rewrites) @
-      map (fn eq => eq RS @{thm eq_reflection}) (rev strips);
+      map mk_meta_eq (rev strips);
   in
     Form
-     {concept = C, structure_term = t'', inner = below thy t'',
+     {concept = C, structure_term = t'', inner = Concept_Type.below_truncations thy t'',
       prop = HOLogic.mk_Trueprop (Concept_Package.holds c t''),
       equation =
         if null steps then NONE
@@ -460,8 +460,9 @@ fun of_thm ctxt th0 =
          {thm = th',
           conclusion =
             Form
-             {concept = C, structure_term = t, inner = below thy t, prop = Thm.concl_of th',
-              equation = NONE}})
+             {concept = C, structure_term = t,
+              inner = Concept_Type.below_truncations thy t,
+              prop = Thm.concl_of th', equation = NONE}})
       end
   end;
 
@@ -482,6 +483,8 @@ end;
 
 type form = Form.form;
 val form_of_goal = Form.of_goal;
+val form_concept = Form.concept;
+val form_structure_term = Form.structure_term;
 val form_prop = Form.prop;
 val form_equation = Form.equation;
 
@@ -501,7 +504,10 @@ val schematic_key = "?";
 fun key_of thy t =
   (case Concept_Type.key_of thy t of
     SOME key => key
-  | NONE => (case Term.head_of (below thy t) of Free (x, _) => ":" ^ x | _ => schematic_key));
+  | NONE =>
+      (case Term.head_of (Concept_Type.below_truncations thy t) of
+        Free (x, _) => ":" ^ x
+      | _ => schematic_key));
 
 (*the schematic variable at the head of the structure of a form, below its truncations: such a
   structure is any structure*)
@@ -751,20 +757,11 @@ fun concept_distance thy N (C, t) distance =
       | NONE => distance)
   | _ => distance);
 
-(*a matcher as an instantiation*)
-fun instantiation (tyenv, tenv) =
-  (TVars.build (tyenv |> Vartab.fold (fn (ai, (S, T)) => TVars.add ((ai, S), T))),
-   Vars.build (tenv |> Vartab.fold (fn (xi, (T, t)) =>
-    Vars.add ((xi, Envir.subst_type tyenv T), t))));
-
 (*a theorem under a matcher, in beta-eta normal form*)
 fun instance_of ctxt env th =
-  let val (instT, inst) = instantiation env in
-    th
-    |> Thm.instantiate
-        (TVars.map (K (Thm.ctyp_of ctxt)) instT, Vars.map (K (Thm.cterm_of ctxt)) inst)
-    |> Conv.fconv_rule Drule.beta_eta_conversion
-  end;
+  th
+  |> Thm.instantiate (Concept_Type.certify ctxt (Concept_Type.instantiation env))
+  |> Conv.fconv_rule Drule.beta_eta_conversion;
 
 (*A rule ... ==> N s on a goal C t, N being C or below it.  First s is matched against t as
   written; else the type layer makes the truncations of the two equal (3.2 of the search plan),
@@ -796,7 +793,7 @@ fun match_rule ctxt ({concept = N, rule, pos, ...}: entry) form =
       the goal and the premises handed back*)
     fun instance env = instance_of ctxt env (Thm.incr_indexes i rule);
     fun instantiated env =
-      Envir.beta_eta_contract o Term_Subst.instantiate (instantiation env) o shift;
+      Envir.beta_eta_contract o Term_Subst.instantiate (Concept_Type.instantiation env) o shift;
   in
     (case
       if N = C then SOME NONE else Option.map SOME (Concept_Package.entailment thy N C)
@@ -873,7 +870,7 @@ fun match_rule ctxt ({concept = N, rule, pos, ...}: entry) form =
                                     (Drule.arg_cong_rule
                                       (Thm.cterm_of ctxt'
                                         (Term.head_of (Concept_Package.holds c (truncated s1))))
-                                      (truncations_eq RS @{thm eq_reflection})))
+                                      (mk_meta_eq truncations_eq)))
                               |> (fn th => @{thm iffD1} OF [goes_at t1, th])
                               |> fold_rev Thm.implies_intr needs
                               |> Thm.implies_intr (Thm.cprop_of assumed);
@@ -994,10 +991,17 @@ fun map_derivation (f: term -> term) (g: thm -> thm) =
 fun prop_of_formula ctxt A th =
   Thm.equal_elim (Thm.symmetric (formula_conv ctxt (Thm.cterm_of ctxt A))) th;
 
-(*the theorems of A1 ... An from that of A1 & (A2 & ... An), n > 0*)
-fun conjuncts 1 th = [th]
-  | conjuncts n th =
-      let val (th1, th2) = HOLogic.conj_elim th in th1 :: conjuncts (n - 1) th2 end;
+(*R from the theorems of P | Q, P ==> R and Q ==> R*)
+fun disj_elim th thP thQ =
+  let
+    val (P, Q) = Thm.dest_binop (HOLogic.dest_judgment (Thm.cprop_of th));
+    val R = HOLogic.dest_judgment (Thm.dest_arg (Thm.cprop_of thP));
+  in
+    Drule.implies_elim_list
+      \<^instantiate>\<open>P and Q and R in
+        lemma (open) \<open>P \<or> Q \<Longrightarrow> (P \<Longrightarrow> R) \<Longrightarrow> (Q \<Longrightarrow> R) \<Longrightarrow> R\<close> by (rule disjE)\<close>
+      [th, thP, thQ]
+  end;
 
 (*The goal of a derivation without schematic variables, from a theorem of its conditions as
   conditions_of gives them.  Every step takes its theorem as the derivation has it: the
@@ -1015,20 +1019,16 @@ fun goal_thm ctxt (Goal {form, solutions, ...}) conditions =
           let
             val (P, Q) = Thm.dest_binop (HOLogic.dest_judgment (Thm.cprop_of th));
             val (cP, cQ) = apply2 HOLogic.mk_judgment (P, Q);
-            val left = solution_thm solution (Thm.assume cP);
-            val R = HOLogic.dest_judgment (Thm.cprop_of left);
           in
-            Drule.implies_elim_list
-              \<^instantiate>\<open>P and Q and R in
-                lemma (open) \<open>P \<or> Q \<Longrightarrow> (P \<Longrightarrow> R) \<Longrightarrow> (Q \<Longrightarrow> R) \<Longrightarrow> R\<close> by (rule disjE)\<close>
-              [th, Thm.implies_intr cP left, Thm.implies_intr cQ (cases rest (Thm.assume cQ))]
+            disj_elim th (Thm.implies_intr cP (solution_thm solution (Thm.assume cP)))
+              (Thm.implies_intr cQ (cases rest (Thm.assume cQ)))
           end
       | cases [] _ = raise Fail "Concept_Intro_Table.goal_thm: a goal without a solution"
 
     and solution_thm (Solution {rule, premises, ...}) th =
       let
         val rule' = Lazy.force rule;
-        val parts = if null premises then [] else conjuncts (length premises) th;
+        val parts = if null premises then [] else Concept_Package.conjuncts (length premises) th;
       in
         Drule.implies_elim_list rule'
           (@{map 3} premise_thm premises (Thm.prems_of rule') parts)
@@ -1178,9 +1178,6 @@ fun extractions_for thy prop =
 
 local
 
-fun plural [x] = x
-  | plural xs = commas (#1 (split_last xs)) ^ " and " ^ #2 (split_last xs);
-
 (*a variable of the premise applied to something that leaves the matching several answers:
   anything but distinct bound variables.  The argument comes back with the names of the bound
   variables around it, innermost first in bs, as the user wrote it*)
@@ -1272,7 +1269,7 @@ fun check_extraction ctxt written th =
           refuse ("cannot have a conclusion containing " ^
             (if length vars = 1 then "a variable" else "variables") ^ " unconstrained in the " ^
             (if length prems = 1 then "premise" else "premises") ^ ": " ^
-            plural (map (show o Var) vars)));
+            Concept_Type.commas_and (map (show o Var) vars)));
     (*the variable at the head of the conclusion must come from the first premise, the only
       one that is matched*)
     val _ =
@@ -1934,7 +1931,9 @@ fun traverse {limit, two_groups, safe_intro, mask, recorder, own_variables} root
                   Simpset*)
                 val (_, _, t) = the (dest_fact thy (Thm.concl_of th));
                 val changed =
-                  not (same_head (Term.head_of (below thy t), Term.head_of (Form.inner form)));
+                  not (same_head
+                    (Term.head_of (Concept_Type.below_truncations thy t),
+                     Term.head_of (Form.inner form)));
                 val work: further =
                  {fact = result, changed = changed,
                   apart =

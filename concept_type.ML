@@ -38,6 +38,9 @@ sig
   val the_info: theory -> string -> info
   val get_instance: theory -> string -> instance option
   val equality: theory -> string -> thm option
+  val instantiation: Type.tyenv * Envir.tenv -> typ TVars.table * term Vars.table
+  val certify: Proof.context -> typ TVars.table * term Vars.table ->
+    ctyp TVars.table * cterm Vars.table
   val fix_schematics: Proof.context -> term list ->
    {context: Proof.context, fix: term -> term, freeze: thm -> thm, thaw: term -> term,
     thawT: typ -> typ, thaw_thm: thm -> thm}
@@ -81,6 +84,7 @@ sig
   val concept_holds: Proof.context -> term -> thm option
   val holds: string -> term -> term
   val plural: 'a list -> string -> string
+  val commas_and: string list -> string
   datatype item =
     Field of binding * typ
   | View of {qualifier: binding, parent: parent, more: typ,
@@ -91,6 +95,7 @@ sig
     items: item list} -> theory -> info * theory
   val mk_truncate: theory -> string -> term -> term
   val dest_truncation: theory -> term -> (string * term) option
+  val below_truncations: theory -> term -> term
   val dest_view: theory -> term -> term option
   val extra_type_variables: string -> (string * sort) list -> 'a
   val header_context: theory -> string ->
@@ -260,6 +265,12 @@ fun put_instance (instance as {name, ...}: instance_entry) =
 
 (* families *)
 
+(*xs as a list in a text: "a", "a and b", "a, b and c"*)
+fun commas_and [x] = x
+  | commas_and xs =
+      let val (front, last) = split_last xs
+      in commas front ^ " and " ^ last end;
+
 (*the member of a family that later members take a layer from; shown: its name as declared;
   theory: where it is defined; layers: those of its type, from the last toward the base*)
 type provider =
@@ -310,12 +321,9 @@ structure Families = Theory_Data'
             apply2 (fn ((family, _), (depth, _)) => (family, depth)));
       val theories = map (Context.theory_base_name o #1) args;
       fun in_order names = filter (member (op =) names) theories;
-      fun listed names =
-        let val (front, last) = split_last names
-        in commas_quote front ^ " and " ^ quote last end;
       fun importing names =
-        if length names = 2 then "both " ^ listed names ^ " import"
-        else listed names ^ " all import";
+        if length names = 2 then "both " ^ commas_and (map quote names) ^ " import"
+        else commas_and (map quote names) ^ " all import";
       fun part ((family, layer), _) =
         "the " ^ Long_Name.base_name layer ^ " part of the family " ^ family;
       fun base ((family, layer), _) = family ^ "." ^ Long_Name.base_name layer;
@@ -326,7 +334,8 @@ structure Families = Theory_Data'
               quote theory
           end);
       val names = in_order (maps (map #1 o #2 o #2) conflicts);
-      fun cannot what = "Cannot merge theories " ^ listed names ^ ": they disagree on " ^ what;
+      fun cannot what =
+        "Cannot merge theories " ^ commas_and (map quote names) ^ ": they disagree on " ^ what;
     in
       (case conflicts of
         [] =>
@@ -1186,6 +1195,10 @@ fun dest_head thy w =
 fun dest_truncation thy w =
   (case dest_head thy w of SOME (Truncate_Head P, _, [u]) => SOME (P, u) | _ => NONE);
 
+(*a structure term below the truncations at its head*)
+fun below_truncations thy t =
+  (case dest_truncation thy t of SOME (_, u) => below_truncations thy u | NONE => t);
+
 (*s of v s for a view v*)
 fun dest_view thy w =
   (case dest_head thy w of SOME (View_Head _, _, [s]) => SOME s | _ => NONE);
@@ -1807,6 +1820,16 @@ fun truncate_eq_of_fields thy L fields =
 fun instantiated ((tyenv, tenv): Type.tyenv * Envir.tenv) =
   Envir.norm_term (Envir.Envir {maxidx = ~1, tenv = tenv, tyenv = tyenv});
 
+(*a matcher as an instantiation*)
+fun instantiation (tyenv, tenv) =
+  (TVars.build (tyenv |> Vartab.fold (fn (ai, (S, T)) => TVars.add ((ai, S), T))),
+   Vars.build (tenv |> Vartab.fold (fn (xi, (T, t)) =>
+    Vars.add ((xi, Envir.subst_type tyenv T), t))));
+
+(*an instantiation certified in ctxt*)
+fun certify ctxt (instT, inst) =
+  (TVars.map (K (Thm.ctyp_of ctxt)) instT, Vars.map (K (Thm.cterm_of ctxt)) inst);
+
 (*the pattern has none of the variables that env instantiates*)
 fun matches thy pair env =
   SOME (Pattern.match thy pair env) handle Pattern.MATCH => NONE | Pattern.Pattern => NONE;
@@ -1823,15 +1846,7 @@ fun match_at thy select obj th =
 (*th so instantiated; Pattern.MATCH without such an instantiation*)
 fun instantiate_at ctxt select obj th =
   (case match_at (Proof_Context.theory_of ctxt) select obj th of
-    SOME ((tyenv, tenv), th') =>
-      let
-        val instT =
-          TVars.build (tyenv |> Vartab.fold (fn (xi, (S, T)) =>
-            TVars.add ((xi, S), Thm.ctyp_of ctxt T)));
-        val inst =
-          Vars.build (tenv |> Vartab.fold (fn (xi, (T, u)) =>
-            Vars.add ((xi, Envir.subst_type tyenv T), Thm.cterm_of ctxt u)));
-      in Thm.instantiate (instT, inst) th' end
+    SOME (env, th') => Thm.instantiate (certify ctxt (instantiation env)) th'
   | NONE => raise Pattern.MATCH);
 
 (*instantiate_at will give a theorem*)
@@ -3106,15 +3121,12 @@ fun prove_truncate_eq ctxt inst known (top: level) =
   name that the context invents is one of theirs*)
 fun fix_schematics ctxt ts =
   let
-    val (inst as (instT, insts), ctxt') =
-      Variable.import_inst true ts (fold Variable.declare_term ts ctxt);
+    val (inst, ctxt') = Variable.import_inst true ts (fold Variable.declare_term ts ctxt);
     val (revertT, revert) = Variable.import_inst_revert inst;
   in
     {context = ctxt',
      fix = Term_Subst.instantiate inst,
-     freeze =
-       Thm.instantiate
-        (TVars.map (K (Thm.ctyp_of ctxt')) instT, Vars.map (K (Thm.cterm_of ctxt')) insts),
+     freeze = Thm.instantiate (certify ctxt' inst),
      thaw = Term_Subst.instantiate_frees (revertT, revert),
      thawT = Term_Subst.instantiateT_frees revertT,
      thaw_thm =
@@ -3821,13 +3833,10 @@ fun covered_layer thy {family, concept} =
 (*the key of a structure term: that of its head below the truncations, the family for a member
   of a family*)
 fun key_of thy t =
-  (case dest_truncation thy t of
-    SOME (_, u) => key_of thy u
-  | NONE =>
-      (case Term.head_of t of
-        Const (c, _) =>
-          (case get_instance_entry thy c of SOME {family = SOME f, ...} => SOME f | _ => SOME c)
-      | _ => NONE));
+  (case Term.head_of (below_truncations thy t) of
+    Const (c, _) =>
+      (case get_instance_entry thy c of SOME {family = SOME f, ...} => SOME f | _ => SOME c)
+  | _ => NONE);
 
 (*the keys linked to a key, through any number of links*)
 fun linked_keys thy key =
