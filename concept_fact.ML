@@ -138,7 +138,8 @@ fun prove_subgoal {max_distance, close_by_premises = closing, maxidx} ctxt subgo
 (** what the user is told about the limit on user rules **)
 
 fun uses n =
-  "using concept_intro rules " ^ string_of_int n ^ (if n = 1 then " time" else " times");
+  "using conditional concept_intro rules " ^ string_of_int n ^
+    (if n = 1 then " time" else " times");
 
 fun increase n =
   "(increase it by \"declare [[concept_fact_user_limit = " ^ string_of_int (2 * n) ^ "]]\")";
