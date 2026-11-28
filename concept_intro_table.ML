@@ -6,8 +6,9 @@ belongs here too: the attribute concept_intro with strengthening; the declaratio
 extraction rules by the attribute concept_extraction; assumption destruction with activation,
 for facts with and without premises; the activation list of a concept at its declaration; what
 a declaration in a theory stores, for a rule, an instance and an import; the function on the
-facts that a context indexes, with the option auto_concept_extraction; the handler of simp for
-the premises that the simplifier assumes.
+facts that a context indexes, with the option auto_concept_extraction; the lookup table of the
+facts of a context, by which conditions are closed; the handler of simp for the premises that
+the simplifier assumes.
 *)
 
 (*** The check on a chain of steps ***)
@@ -298,6 +299,8 @@ sig
   val has_work: theory -> term -> bool  (*for tests*)
   val auto_extraction: bool Config.T
   val concept_extract: Proof.context -> Proof.context
+  val lookup_fact: Proof.context -> term -> thm option
+  val lookup_table: Proof.context -> thm list  (*for tests*)
 end;
 
 (*the form of a concept fact, sealed inside Concept_Intro_Table*)
@@ -754,6 +757,15 @@ fun instantiation (tyenv, tenv) =
    Vars.build (tenv |> Vartab.fold (fn (xi, (T, t)) =>
     Vars.add ((xi, Envir.subst_type tyenv T), t))));
 
+(*a theorem under a matcher, in beta-eta normal form*)
+fun instance_of ctxt env th =
+  let val (instT, inst) = instantiation env in
+    th
+    |> Thm.instantiate
+        (TVars.map (K (Thm.ctyp_of ctxt)) instT, Vars.map (K (Thm.cterm_of ctxt)) inst)
+    |> Conv.fconv_rule Drule.beta_eta_conversion
+  end;
+
 (*A rule ... ==> N s on a goal C t, N being C or below it.  First s is matched against t as
   written; else the type layer makes the truncations of the two equal (3.2 of the search plan),
   which takes that the truncation goes below C on both sides.  The schematic variables of the
@@ -782,13 +794,7 @@ fun match_rule ctxt ({concept = N, rule, pos, ...}: entry) form =
 
     (*the instance of the rule under a matcher of s, in beta-eta normal form like the form of
       the goal and the premises handed back*)
-    fun instance env =
-      let val (instT, inst) = instantiation env in
-        Thm.incr_indexes i rule
-        |> Thm.instantiate
-            (TVars.map (K (Thm.ctyp_of ctxt)) instT, Vars.map (K (Thm.cterm_of ctxt)) inst)
-        |> Conv.fconv_rule Drule.beta_eta_conversion
-      end;
+    fun instance env = instance_of ctxt env (Thm.incr_indexes i rule);
     fun instantiated env =
       Envir.beta_eta_contract o Term_Subst.instantiate (instantiation env) o shift;
   in
@@ -1469,14 +1475,9 @@ fun elim_first ctxt rule th =
       Pattern.match (Proof_Context.theory_of ctxt)
         (Envir.beta_eta_contract (Thm.major_prem_of rule'), Thm.concl_of th)
         (Vartab.empty, Vartab.empty);
-    val (instT, inst) = instantiation env;
-    val rule'' =
-      Thm.instantiate
-        (TVars.map (K (Thm.ctyp_of ctxt)) instT, Vars.map (K (Thm.cterm_of ctxt)) inst) rule'
-      |> Conv.fconv_rule Drule.beta_eta_conversion;
   in
     Thm.bicompose (SOME ctxt) {flatten = false, match = true, incremented = true}
-      (false, th, Thm.nprems_of th) 1 rule''
+      (false, th, Thm.nprems_of th) 1 (instance_of ctxt env rule')
     |> Seq.hd |> normal ctxt
   end;
 
@@ -2540,12 +2541,114 @@ val _ =
       "declaring an introduction rule, used to prove that a structure is a concept" #> #2);
 
 
-(* the facts that a context indexes *)
+
+(** the lookup table **)
+
+(*The facts of a context that are propositions of HOL, in the forms in which a condition may be
+  written (4.3 of the plan of conditions), each form by its parts.  The table belongs to the
+  package: its theorems are not noted, so the function on the indexed facts never meets them.
+  Two facts are one where their propositions differ in the names of schematic variables only*)
+structure Lookup = Proof_Data
+(
+  type T = thm Item_Net.T;
+  fun init _ =
+    Item_Net.init (op aconv o apply2 (canonical o Thm.prop_of)) (single o Thm.prop_of);
+);
+
+val lookup_table = Item_Net.content o Lookup.get;
+
+(*A theorem of the proposition prop, which is in beta-eta normal form: an instance of a fact of
+  the table.  Only the schematic variables of the fact are instantiated; those of prop stay*)
+fun lookup_fact ctxt prop =
+  let
+    val thy = Proof_Context.theory_of ctxt;
+    val i = Term.maxidx_of_term prop + 1;
+    fun instance th0 =
+      let val th = Thm.incr_indexes i th0 in
+        try (Pattern.match thy (Thm.prop_of th, prop)) (Vartab.empty, Vartab.empty)
+        |> Option.map (fn env => instance_of ctxt env th)
+      end;
+  in get_first instance (Item_Net.retrieve_matching (Lookup.get ctxt) prop) end;
+
+(*the parts by which a form goes in: what open_fact gives of it, without True and without what
+  is no proposition of HOL, as a part with premises*)
+fun lookup_parts th =
+  open_fact th |> filter (fn part =>
+    (case Thm.prop_of part of
+      \<^Const_>\<open>Trueprop for \<^Const_>\<open>True\<close>\<close> => false
+    | \<^Const_>\<open>Trueprop for _\<close> => true
+    | _ => false));
+
+(*the first theorem of a proposition stays*)
+fun add_part th table = if Item_Net.member table th then table else Item_Net.update th table;
+
+(*the closing simpset of the simpset of a context, kept with that simpset: making one takes a
+  deletion for each simproc of the package, and the facts of a context mostly come in under
+  one simpset*)
+structure Closing = Proof_Data
+(
+  type T = (simpset * Concept_Type.closing_simpset) option;
+  fun init _ = NONE;
+);
+
+fun closing_simpset ctxt =
+  let
+    val ss = Simplifier.simpset_of ctxt;
+    fun made () =
+      let val closing = Concept_Type.closing_simpset ctxt ss
+      in (closing, Closing.put (SOME (ss, closing)) ctxt) end;
+  in
+    (case Closing.get ctxt of
+      SOME (ss', closing) => if pointer_eq (ss, ss') then (closing, ctxt) else made ()
+    | NONE => made ())
+  end;
+
+(*The forms of a fact th after the one as written: th rewritten by the selector Simpset; that,
+  or th where there is none, simplified once by the closing simpset.  A step that fails, as
+  with a simproc of the user that fails, gives no form, like a simplification for which the
+  steps do not suffice; nothing is said, and no error of it reaches the proof of the user.
+  The schematic variables of th are fixed meanwhile*)
+fun further_forms ctxt closing th =
+  let
+    val {context = ctxt', freeze, thaw_thm, ...} =
+      Concept_Type.fix_schematics ctxt (Thm.prop_of th :: Thm.hyps_of th);
+    fun step conv th' =
+      Option.join (\<^try>\<open>conv (Thm.cprop_of th')\<close>)
+      |> Option.map (fn eq => Thm.equal_elim eq th');
+    val rewritten =
+      if Concept_Type.may_rewrite ctxt (Thm.prop_of th) then
+        step (SOME o (Concept_Type.selector_conv ctxt' then_conv Drule.beta_eta_conversion))
+          (freeze th)
+      else NONE;
+    val simplified =
+      step (Concept_Type.closing_rewrite ctxt' closing) (the_default (freeze th) rewritten);
+  in map thaw_thm (the_list rewritten @ the_list simplified) end;
+
+(*A fact that comes in enters the table by the parts of its forms, unless the table has every
+  part of the fact as written: the same fact comes in more than once, and what is there is not
+  simplified again.  A fact with premises has no part*)
+fun enter_lookup th0 ctxt =
+  let
+    val th = normal ctxt th0;
+    val written = lookup_parts th;
+  in
+    if forall (Item_Net.member (Lookup.get ctxt)) written then ctxt
+    else
+      let val (closing, ctxt') = closing_simpset ctxt in
+        Lookup.map
+          (fold add_part (written @ maps lookup_parts (further_forms ctxt' closing th))) ctxt'
+      end
+  end;
+
+
+
+(** the facts that a context indexes **)
 
 (*Proof_Context.Indexed_Facts hands over each fact that a context indexes by its proposition:
   the facts of a proof, the assumptions and notes of a statement or of an unnamed context, and
   what a block exports.  A theorem of the theory or of a level of a local theory is not
-  indexed; it enters by [concept_intro]*)
+  indexed: it goes into the intro table by [concept_intro] only, and never enters the lookup
+  table*)
 
 (*whether assumption destruction may take something from a proposition, read without
   inference: it may say yes in vain, never no where there is work.  It reads the conclusion as
@@ -2595,14 +2698,22 @@ fun take_facts ths ctxt =
       (case Exn.result (take_in th) ctxt' of
         Exn.Res ctxt'' => ctxt''
       | Exn.Exn exn =>
-          if Exn.is_interrupt exn then Exn.reraise exn
-          else
-            (if Config.get ctxt' extraction_trace then
-              tracing ("concept: the fact " ^ Thm.string_of_thm ctxt' th ^
-                " is not taken apart:\n" ^ Runtime.exn_message exn)
-             else ();
-             ctxt')))
+          (if Config.get ctxt' extraction_trace then
+            tracing ("concept: the fact " ^ Thm.string_of_thm ctxt' th ^
+              " is not taken apart:\n" ^ Runtime.exn_message exn)
+           else ();
+           ctxt')))
     ths ctxt;
+
+(*What is done with the facts that come in.  Assumption destruction takes those that are not
+  marked as handled and have work.  All of them enter the lookup table, after that: the
+  selector Simpset rewrites them with the concept facts among them known*)
+fun take_now ths ctxt =
+  let val thy = Proof_Context.theory_of ctxt in
+    ctxt
+    |> take_facts (filter (fn th => not (is_handled th) andalso has_work thy (Thm.prop_of th)) ths)
+    |> fold enter_lookup ths
+  end;
 
 (*the facts of a statement that were kept while auto_concept_extraction was off, the latest
   first*)
@@ -2615,31 +2726,26 @@ structure Kept = Proof_Data
 val auto_extraction =
   Attrib.setup_config_bool \<^binding>\<open>auto_concept_extraction\<close> (K true);
 
-(*what was kept, taken apart now in the order it came.  Nothing stays kept: a second call does
+(*what was kept, taken now in the order it came.  Nothing stays kept: a second call does
   nothing.  For a state whose goal was stated with the option off: on the context of the goal,
   before the first step of the proof*)
 fun concept_extract ctxt =
   (case Kept.get ctxt of
     [] => ctxt
-  | ths => ctxt |> Kept.put [] |> take_facts (rev ths));
+  | ths => ctxt |> Kept.put [] |> take_now (rev ths));
 
-(*A theorem marked as handled is passed over, as is one without work.  A fact of a proof body
-  is taken apart at once.  A fact of a statement is too, unless auto_concept_extraction is off:
-  then it is kept for concept_extract*)
+(*A fact of a proof body is taken at once.  A fact of a statement is too, unless
+  auto_concept_extraction is off: then it is kept for concept_extract, and nothing is done
+  with it before*)
 fun take_indexed ths ctxt =
-  let
-    val thy = Proof_Context.theory_of ctxt;
-    val ths' = filter (fn th => not (is_handled th) andalso has_work thy (Thm.prop_of th)) ths;
-  in
-    if null ths' then ctxt
-    else if Variable.is_body ctxt orelse Config.get ctxt auto_extraction then take_facts ths' ctxt
-    else Kept.map (fold cons ths') ctxt
-  end;
+  if Variable.is_body ctxt orelse Config.get ctxt auto_extraction then take_now ths ctxt
+  else Kept.map (fold cons ths) ctxt;
 
 val _ = Theory.setup (Context.theory_map (Proof_Context.Indexed_Facts.add 0 take_indexed));
 
 
-(* the premises that the simplifier assumes *)
+
+(** the premises that the simplifier assumes **)
 
 (*Inside the selector Simpset (4A.6): a concept fact is strengthened and put with the mask of
   its premise, where the premise is in force; nothing is taken apart or activated, and a
