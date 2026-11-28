@@ -2702,10 +2702,9 @@ fun pairs ctxt news rels =
 (*a term as a candidate of MePo, when the name written for it denotes an equation*)
 fun candidate ctxt t =
   let
-    val s = Sledgehammer_Util.hackish_string_of_term ctxt t;
     val name =
-      "[[concept_selector " ^ (if exists_string (fn c => c = "\"") s then cartouche s else quote s) ^
-        "]]";
+      "[[concept_selector " ^
+        Symbol_Pos.quote_string_qq (ATP_Util.content_of_pretty (Syntax.pretty_term ctxt t)) ^ "]]";
   in
     (case try (Sledgehammer_Util.thms_of_name ctxt) name of
       SOME [th] =>
