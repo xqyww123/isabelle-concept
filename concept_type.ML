@@ -16,7 +16,8 @@ synthesizes the equations of the selectors on instances, views and truncate.  Th
 selector Simpset rewrites with these simprocs and with no rule of the theory's simpset; as in
 simp, what its congruence rules assume (P in P --> Q, x : A under a bounded quantifier) rewrites
 the other side.  It is used through selector_rewrite, selector_conv, selector_simp_tac and
-selector_simplify only, each call within a bound on the simplifier steps.
+selector_simplify only, each call within a bound on the simplifier steps.  The conditions of
+rules are closed in a simpset without anything of the package (closing_simpset, closing_rewrite).
 *)
 
 signature CONCEPT_TYPE =
@@ -66,6 +67,13 @@ sig
   val selector_simplify: Proof.context -> thm -> thm option
   val map_selector_simpset: (Proof.context -> Proof.context) -> Context.generic -> Context.generic
   val may_rewrite: Proof.context -> term -> bool
+  val add_simproc: simproc -> Context.generic -> Context.generic
+  val add_mksimps_handler: string * Simplifier.mksimps_handler -> Context.generic ->
+    Context.generic
+  type closing_simpset
+  val closing_simpset: Proof.context -> simpset -> closing_simpset
+  val closing_bound: int
+  val closing_rewrite: Proof.context -> closing_simpset -> cterm -> thm option
   val selector_equation: Proof.context -> term -> thm option
   val source_equation: Proof.context -> term -> thm option
   val concept_holds: Proof.context -> term -> thm option
@@ -1062,6 +1070,61 @@ fun selector_simplify ctxt th =
             ([], Simplifier.add_prems [prem] ctxt''))) th) ctxt;
 
 end;
+
+
+(** the simpset that closes conditions **)
+
+(*what the package has put into the simpset of a context: its simprocs, each under a serial
+  taken where it is added (several share a name, and no equality on simprocs is exported), and
+  the names of its mksimps handlers*)
+structure Package_Items = Generic_Data
+(
+  type T = simproc Inttab.table * string list;
+  val empty = (Inttab.empty, []);
+  fun merge ((procs, names), (procs', names')) =
+    (Inttab.merge (K true) (procs, procs'), Library.merge (op =) (names, names'));
+);
+
+(*the package puts simprocs and mksimps handlers into the simpset of a context only through these
+  two, so that closing_simpset takes all of them out*)
+fun add_simproc proc context =
+  context
+  |> Simplifier.map_simpset (Simplifier.add_proc proc)
+  |> Package_Items.map (apfst (Inttab.update (serial (), proc)));
+
+fun add_mksimps_handler (name, handler) context =
+  context
+  |> Simplifier.map_simpset (Simplifier.add_mksimps_handler (name, handler))
+  |> Package_Items.map (apsnd (insert (op =) name));
+
+(*a simpset in which nothing of the package runs*)
+datatype closing_simpset = Closing_Simpset of simpset;
+
+(*ss without what the package has put into simpsets; on an invisible context, as ss may lack
+  some of it*)
+fun closing_simpset ctxt ss =
+  let val (procs, names) = Package_Items.get (Context.Proof ctxt) in
+    Closing_Simpset
+      (Simplifier.simpset_map (Context_Position.set_visible false ctxt)
+        (Inttab.fold (Simplifier.del_proc o #2) procs #>
+          fold Simplifier.del_mksimps_handler names) ss)
+  end;
+
+val closing_bound = 400;
+
+(*ct rewritten once as in asm_lr_rewrite by the closing simpset, with the premises of ctxt that it
+  lacks, in beta-eta normal form; none where closing_bound simplifier steps do not suffice;
+  EXCEEDED, as in Simp_Steps.limited, where a bounded run around has reached its bound*)
+fun closing_rewrite ctxt (Closing_Simpset ss) ct =
+  let
+    val ctxt1 = Simplifier.put_simpset ss ctxt;
+    val ctxt2 =
+      Simplifier.add_prems
+        (subtract Thm.eq_thm_prop (Simplifier.prems_of ctxt1) (Simplifier.prems_of ctxt)) ctxt1;
+  in
+    Simp_Steps.limited closing_bound
+      (fn ctxt3 => (Simplifier.asm_lr_rewrite ctxt3 then_conv Drule.beta_eta_conversion) ct) ctxt2
+  end;
 
 
 (** the selector simproc **)
@@ -2252,11 +2315,11 @@ fun kind_arities thy c =
 (*the simproc on these left sides, in the simpset and in the selector Simpset*)
 fun add_selector_simproc name lhss context =
   let
-    val add =
-      Simplifier.add_proc (Simplifier.make_simproc (Context.proof_of context)
+    val proc =
+      Simplifier.make_simproc (Context.proof_of context)
         {name = name, kind = Simplifier.Simproc, lhss = lhss, proc = K selector_proc,
-         identifier = []});
-  in context |> Simplifier.map_simpset add |> map_selector_simpset add end;
+         identifier = []};
+  in context |> add_simproc proc |> map_selector_simpset (Simplifier.add_proc proc) end;
 
 (*the split of the more of the layer below that of concept name, whose views are defined, as
   users see it: an anonymous leaf is read through its view; its simproc on the equations at the

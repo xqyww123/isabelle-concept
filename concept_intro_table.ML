@@ -2673,15 +2673,15 @@ fun simp_handler ctxt th =
 val _ =
   Theory.setup (fn thy =>
     let
-      val add =
-        Simplifier.add_mksimps_handler ("concept",
+      val handler =
+        ("concept",
           Simplifier.make_mksimps_handler
            {patterns = [HOLogic.mk_Trueprop (Free ("P", HOLogic.boolT))], priority = ~1,
             kept_by_clear_simpset = false, handler = simp_handler});
     in
       thy
-      |> Simplifier.map_theory_simpset add
-      |> Context.theory_map (Concept_Type.map_selector_simpset add)
+      |> Context.theory_map (Concept_Type.add_mksimps_handler handler #>
+        Concept_Type.map_selector_simpset (Simplifier.add_mksimps_handler handler))
     end);
 
 end;
