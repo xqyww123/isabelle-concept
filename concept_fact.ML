@@ -12,10 +12,10 @@ signature CONCEPT_FACT =
 sig
   type derivation = Concept_Intro_Table.derivation
   val trace: bool Config.T
-  val search: {max_distance: int option} -> Proof.context -> term ->
-    derivation Concept_Intro_Table.result
+  val search: {max_distance: int option, closing: Concept_Search.closing} -> Proof.context ->
+    term -> derivation Concept_Intro_Table.result
   val prove: Proof.context -> derivation -> thm
-  val unconditional_fact: Proof.context -> term -> thm option
+  val unconditional_fact: Concept_Search.closing -> Proof.context -> term -> thm option
   val concept_fact_tac: {max_distance: int option, warn_user_limit: bool} ->
     Proof.context -> int -> tactic
   val prove_proposition: Proof.context -> string * Position.T -> thm
@@ -39,8 +39,8 @@ val search = Concept_Search.search;
 
 val prove = Concept_Search.prove;
 
-fun unconditional_fact ctxt goal =
-  Option.map (prove ctxt) (Concept_Search.search_unconditional ctxt goal);
+fun unconditional_fact closing ctxt goal =
+  Option.map (prove ctxt) (Concept_Search.search_unconditional closing ctxt goal);
 
 
 (** the procedure of the selector Simpset for the conditions of its rules **)
@@ -49,7 +49,8 @@ fun unconditional_fact ctxt goal =
   that the simplifier hands over, unchanged: there the search finds what the searches around
   this simplification tell it, and what it raises goes through to them*)
 fun condition_proc ctxt ct =
-  unconditional_fact ctxt (HOLogic.mk_Trueprop (Thm.term_of ct))
+  unconditional_fact (Concept_Search.Lookup_And_Simplification NONE) ctxt
+    (HOLogic.mk_Trueprop (Thm.term_of ct))
   |> Option.map (fn th => th RS @{thm Eq_TrueI});
 
 val _ =
@@ -105,7 +106,10 @@ fun prove_subgoal {max_distance, close_by_premises = closing, maxidx} ctxt subgo
       Intro.destruct_assms {safe_intro = false, notation = false, masked_entries = false}
         Intro.Internal_Call prems ctxt2;
   in
-    (case Concept_Search.search {max_distance = max_distance} ctxt3
+    (case
+      Concept_Search.search
+        {max_distance = max_distance, closing = Concept_Search.Lookup_And_Simplification NONE}
+        ctxt3
         (Thm.term_of (Drule.strip_imp_concl body)) of
       Intro.Failed failure => Intro.Failed failure
     | Intro.Found {value = derivation, cut_short} =>
@@ -295,7 +299,7 @@ fun host_premise thy {host, conditions} =
         Intro.destruct_assms {safe_intro = false, notation = false, masked_entries = false}
           Intro.Host_Premise [Thm.assume cond]) assumed ctxt;
   in
-    unconditional_fact ctxt' host
+    unconditional_fact (Concept_Search.Lookup_And_Simplification NONE) ctxt' host
     |> Option.map
         (Drule.implies_intr_list assumed #> singleton (Variable.export ctxt ctxt0) #>
           Drule.zero_var_indexes)

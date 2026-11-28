@@ -60,6 +60,7 @@ sig
     cong_rule option
   val add_derived_congs: term -> thm -> string list -> theory -> theory
   val in_selector_simp: Proof.context -> bool
+  val replaced_simpset: Proof.context -> simpset option
   val trace: bool Config.T
   val restoring: (unit -> exn option -> unit) -> Proof.context -> Proof.context
   val selector_rewrite: Proof.context -> cterm -> thm option
@@ -967,6 +968,16 @@ fun bounded simplifying f ctxt =
     | result => result)
   end;
 
+(*the simpset that the selector Simpset replaced on a context, where it is put on one that has
+  not had it: the contextual simpset of a search that a run of the selector Simpset starts*)
+structure Replaced_Simpset = Proof_Data
+(
+  type T = simpset option;
+  fun init _ = NONE;
+);
+
+val replaced_simpset = Replaced_Simpset.get;
+
 (*only here is the selector Simpset put on a context: map_selector_simpset does it to change it,
   the four entries to run it, each within a bound.  A procedure that the selector Simpset calls
   gets a context with the counters of the entry*)
@@ -1018,6 +1029,7 @@ structure Selector_Simpset = Generic_Data
   simplification has assumed (put_simpset alone drops them)*)
 fun put_selector_simpset ctxt =
   ctxt
+  |> Replaced_Simpset.map (fn NONE => SOME (Simplifier.simpset_of ctxt) | kept => kept)
   |> Simplifier.put_simpset (#1 (Selector_Simpset.get (Context.Proof ctxt)))
   |> Simplifier.add_prems (Simplifier.prems_of ctxt)
   |> Config.put in_selector_simp_config true;
@@ -1103,27 +1115,31 @@ fun add_mksimps_handler (name, handler) context =
 (*a simpset in which nothing of the package runs*)
 datatype closing_simpset = Closing_Simpset of simpset;
 
-(*ss without what the package has put into simpsets; on an invisible context, as ss may lack
-  some of it*)
+(*ss at simp depth 0, without what the package has put into simpsets; on an invisible context,
+  as ss may lack some of it*)
 fun closing_simpset ctxt ss =
   let val (procs, names) = Package_Items.get (Context.Proof ctxt) in
     Closing_Simpset
       (Simplifier.simpset_map (Context_Position.set_visible false ctxt)
-        (Inttab.fold (Simplifier.del_proc o #2) procs #>
+        (Simplifier.reset_simp_depth #>
+          Inttab.fold (Simplifier.del_proc o #2) procs #>
           fold Simplifier.del_mksimps_handler names) ss)
   end;
 
 val closing_bound = 400;
 
 (*ct rewritten once as in asm_lr_rewrite by the closing simpset, with the premises of ctxt that it
-  lacks, in beta-eta normal form; none where closing_bound simplifier steps do not suffice;
-  EXCEEDED, as in Simp_Steps.limited, where a bounded run around has reached its bound*)
+  lacks, in beta-eta normal form; none where closing_bound simplifier steps do not suffice.  The
+  steps count on that bound alone, on no counter of a bounded run around: the context of the
+  rewriting takes its open counters, which are none, from a context made of the theory*)
 fun closing_rewrite ctxt (Closing_Simpset ss) ct =
   let
     val ctxt1 = Simplifier.put_simpset ss ctxt;
     val ctxt2 =
-      Simplifier.add_prems
-        (subtract Thm.eq_thm_prop (Simplifier.prems_of ctxt1) (Simplifier.prems_of ctxt)) ctxt1;
+      ctxt1
+      |> Simplifier.add_prems
+          (subtract Thm.eq_thm_prop (Simplifier.prems_of ctxt1) (Simplifier.prems_of ctxt))
+      |> Simp_Steps.inherit (Proof_Context.init_global (Proof_Context.theory_of ctxt));
   in
     Simp_Steps.limited closing_bound
       (fn ctxt3 => (Simplifier.asm_lr_rewrite ctxt3 then_conv Drule.beta_eta_conversion) ct) ctxt2
