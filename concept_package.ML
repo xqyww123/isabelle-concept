@@ -24,6 +24,7 @@ sig
   val ancestors: theory -> string -> (string * entailment) list
   val holds: string -> term -> term
   val truncation_equation: Proof.context -> string -> term -> thm option
+  val conjuncts: int -> thm -> thm list
   type instance_facts = {destructions: (string * thm) list, of_concept: thm}
   val add_instance_facts: string -> instance_facts -> theory -> theory
   val instance_facts: theory -> string -> instance_facts option
@@ -155,10 +156,7 @@ fun declare_type ({args, name = b, major, items, ...}: header) thy =
           | (NONE, SOME (pos, _)) => error (bad_syntax pos))
         end);
     (*the sorts of the type parameters that the types determine*)
-    val Ts =
-      maps #1 (the_list parent) @
-      maps (fn Concept_Type.Field (_, T) => [T]
-        | Concept_Type.View {parent = (Ts, _), more, ...} => more :: Ts) items';
+    val Ts = maps #1 (the_list parent) @ maps Concept_Type.item_types items';
     val ctxt' = fold Variable.declare_typ Ts ctxt;
     val args'' = map (Proof_Context.check_tfree ctxt') args';
   in Concept_Type.declare {name = b, args = args'', parent = parent, items = items'} thy end;
@@ -193,10 +191,7 @@ fun read_assumptions thy name (assumes: (Attrib.binding * (string * string list)
           " itself, which is a circular reference")
       else ());
     (*the type variables that the user wrote*)
-    val written =
-      (fold o fold o Term.fold_types o Term.fold_atyps)
-        (fn TFree (a, _) => if String.isPrefix "'" a then insert (op =) a else I | _ => I)
-        parsed [];
+    val written = filter (String.isPrefix "'") ((fold o fold) Term.add_tfree_names parsed []);
     val names = Variable.names_of ((fold o fold) Variable.declare_term parsed ctxt);
     val (parsed', _) = (fold_map o fold_map) Term.free_dummy_patterns parsed names;
     fun close prop =
@@ -216,9 +211,7 @@ fun read_assumptions thy name (assumes: (Attrib.binding * (string * string list)
                 error ("The assumption " ^ at a ^ " " ^
                   Undetermined_Types.message ctxt (Undetermined_Types.to_annotate determined prop))
             | named => Concept_Type.extra_type_variables cname named))));
-    val export =
-      Term.map_aterms (fn u as Free (x, _) => the_default u (AList.lookup (op =) substitution x)
-        | u => u);
+    val export = Concept_Type.substitute substitution;
   in (S, map2 (fn (a, _) => fn props => (a, map export props)) assumes checked) end;
 
 
@@ -343,7 +336,7 @@ fun instance_facts thy c =
 (** the predicate **)
 
 (*the predicate of a concept is the constant of the concept's name; the base's is its selector*)
-fun holds name t = Const (name, fastype_of t --> \<^Type>\<open>bool\<close>) $ t;
+val holds = Concept_Type.holds;
 
 (*C (P.truncate u) = C u for the predicate of the name c on t = P.truncate u, where the selector
   simprocs give it without premises: only then does a truncation directly below C go.  On a
@@ -355,7 +348,8 @@ fun truncation_equation ctxt c t =
 
 (*the n conjuncts of a right-nested conjunction*)
 fun conjuncts 1 th = [th]
-  | conjuncts n th = (th RS @{thm conjunct1}) :: conjuncts (n - 1) (th RS @{thm conjunct2});
+  | conjuncts n th =
+      let val (th1, th2) = HOLogic.conj_elim th in th1 :: conjuncts (n - 1) th2 end;
 
 (*the entailments of a new concept from the rules to its direct parents, in header order: the
   shorter way wins, among equals the earlier parent*)
@@ -444,11 +438,7 @@ fun define b S major (views: (string * string * term) list)
 
     (* the truncate congruence rule of the predicate: C (P.truncate t) = C t *)
 
-    val thy2 =
-      (case Concept_Type.derive_truncate_cong ctxt1
-          {const = Const (name, fastype_of S --> \<^Type>\<open>bool\<close>), def = def, position = 0} of
-        SOME rule => thy1 |> Context.theory_map (Concept_Type.add_truncate_cong (name, 0) rule)
-      | NONE => thy1);
+    val thy2 = Concept_Type.add_derived_congs (Term.head_of head) def [#1 (dest_Free S)] thy1;
     val ctxt2 = Proof_Context.init_global thy2 |> Variable.declare_term S;
 
     (* construction rule *)
@@ -475,7 +465,7 @@ fun define b S major (views: (string * string * term) list)
         (fn {context = ctxt', ...} =>
           rewrite_goals_tac ctxt' [def] THEN
           resolve_tac ctxt'
-            [foldr1 (fn (th, th') => @{thm conjI} OF [th, th'])
+            [foldr1 (uncurry HOLogic.conj_intr)
               (map (fn (prem, f) => f (Thm.assume (Thm.cterm_of ctxt' prem))) premises)] 1);
 
     (* facts *)
@@ -891,7 +881,7 @@ fun pretty_constants thy ({name = b, items, ...}: header) =
         Pretty.quote (Syntax.pretty_typ ctxt (Logic.unvarifyT_global (Sign.the_const_type thy c)))];
   in
     Pretty.chunks
-      (Pretty.str ("Defined the new " ^ (case consts of [_] => "constant" | _ => "constants")) ::
+      (Pretty.str ("Defined the new " ^ Concept_Type.plural consts "constant") ::
         map line consts)
   end;
 

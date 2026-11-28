@@ -74,6 +74,9 @@ struct
 (*a premise of a rule: a goal again, or a condition that the rule leaves*)
 datatype ('a, 'c) premise = Subgoal of 'a | Condition of 'c;
 
+fun map_premise f _ (Subgoal a) = Subgoal (f a)
+  | map_premise _ g (Condition c) = Condition (g c);
+
 (*a rule on a goal.  premises: in their order, a goal with whether it stays at the distance of
   the goal of the rule; user: a user rule: its step counts for the limit on user rules where it
   leaves a condition*)
@@ -245,7 +248,7 @@ fun conditions (reading: ('g, 'w, 's) reading) derivation =
   let
     fun left (Derivation {goal, solutions}) =
       leave reading goal (solutions |> map (fn {premises, ...} =>
-        premises |> map (fn Subgoal d => Subgoal (left d) | Condition c => Condition c)));
+        map (map_premise left I) premises));
   in clean reading (left derivation) end;
 
 datatype failure = No_Plan | User_Limit;
@@ -260,8 +263,8 @@ datatype ('g, 'w, 'r, 's) result =
 (*the key of a goal with its distance*)
 structure Keytab = Table(type key = int * int val ord = prod_ord int_ord int_ord);
 
-(*effective distance, steps that leave conditions, steps, age*)
-structure Queue = Heap(type elem = int list val ord = dict_ord int_ord);
+(*the branches waiting, by effective distance, steps that leave conditions, steps, age*)
+structure Queue = Table(type key = int list val ord = dict_ord int_ord);
 
 (*what a branch has to do next: a goal; or the end of the solution of a goal, with the three
   numbers of the branch when it began*)
@@ -306,14 +309,11 @@ fun search_told (problem: ('g, 'w, 'r, 'c, 's) problem) (limits: limits)
 
     (* the queue *)
 
-    val queue = Unsynchronized.ref Queue.empty;
-    val queued = Unsynchronized.ref Inttab.empty;
+    val queue = Unsynchronized.ref (Queue.empty: ('g, 'r, 'c) branch Queue.table);
     val age = Unsynchronized.ref 0;
     fun push (b as {eff, ncond, nrules, ...}: ('g, 'r, 'c) branch) =
-      let val n = Unsynchronized.inc age in
-        Unsynchronized.change queue (Queue.insert [eff, ncond, nrules, n]);
-        Unsynchronized.change queued (Inttab.update (n, b))
-      end;
+      Unsynchronized.change queue
+        (Queue.update ([eff, ncond, nrules, Unsynchronized.inc age], b));
 
 
     (* the table *)
@@ -400,8 +400,7 @@ fun search_told (problem: ('g, 'w, 'r, 'c, 's) problem) (limits: limits)
     fun solutions read sols : ('g, 'r, 's) solution list =
       sols |> map (fn (rule, premises) =>
         {rule = rule,
-         premises =
-          premises |> map (fn Subgoal d => Subgoal d | Condition c => Condition (read c))});
+         premises = map (map_premise I read) premises});
     fun derivation read goal sols = Derivation {goal = goal, solutions = solutions read sols};
 
     fun situation dist steps under_way : 'g situation =
@@ -438,8 +437,7 @@ fun search_told (problem: ('g, 'w, 'r, 'c, 's) problem) (limits: limits)
     fun evaluate read admitted =
       let
         fun node goal sols =
-          leave reading goal (sols |> map (fn (_, premises) =>
-            premises |> map (fn Subgoal conj => Subgoal conj | Condition c => Condition (read c))));
+          leave reading goal (sols |> map (fn (_, premises) => map (map_premise I read) premises));
         val conj = clean reading (node top (the (build admitted node top_key)));
       in (conj, count conj) end;
 
@@ -587,19 +585,14 @@ fun search_told (problem: ('g, 'w, 'r, 'c, 's) problem) (limits: limits)
     (* the queue is worked off *)
 
     fun work () =
-      if ! stopped orelse Queue.is_empty (! queue) then ()
+      if ! stopped then ()
       else
-        let val (elem, queue') = Queue.min_elem (! queue) in
-          (*no branch left that can tie with the first solution*)
-          if (case ! first of SOME distance => hd elem > distance | NONE => false) then ()
-          else
-            let val n = List.last elem in
-              queue := queue';
-              run (the (Inttab.lookup (! queued) n)
-                before Unsynchronized.change queued (Inttab.delete n));
-              work ()
-            end
-        end;
+        (case Queue.min (! queue) of
+          NONE => ()
+        | SOME (key, b) =>
+            (*no branch left that can tie with the first solution*)
+            if (case ! first of SOME distance => hd key > distance | NONE => false) then ()
+            else (Unsynchronized.change queue (Queue.delete key); run b; work ()));
 
     val cut_short =
       (push
@@ -872,16 +865,13 @@ fun tidy ctxt derivation =
             val cert = Thm.cterm_of ctxt' o fix;
             val formula_conv = Intro.formula_conv ctxt';
 
-            val conj_intro = foldr1 (fn (th, th') => @{thm conjI} OF [th, th']);
-            fun conj_elims 1 th = [th]
-              | conj_elims n th =
-                  (th RS @{thm conjunct1}) :: conj_elims (n - 1) (th RS @{thm conjunct2});
+            val conj_intro = foldr1 (uncurry HOLogic.conj_intr);
 
             (*A from !!xs. Hs ==> A at the parameters of the wrapper, its hypotheses assumed;
               and back*)
             fun instance ({params, hyps}: wrapper) th =
               th |> fold (Thm.forall_elim o cert o Free o #2) params
-              |> fold (fn hyp => fn th' => Thm.implies_elim th' (Thm.assume (cert hyp))) hyps;
+              |> (fn th' => Drule.implies_elim_list th' (map (Thm.assume o cert) hyps));
             fun generalize ({params, hyps}: wrapper) th =
               th |> fold_rev (Thm.implies_intr o cert) hyps
               |> fold_rev (Thm.forall_intr o cert o Free o #2) params;
@@ -914,10 +904,10 @@ fun tidy ctxt derivation =
                     (case (go_on (branch, Thm.assume cP), cases (Thm.assume cQ) rest go_on) of
                       (SOME th1, SOME th2) =>
                         SOME
-                          (Drule.infer_instantiate ctxt'
-                            [(("P", 0), cert P), (("Q", 0), cert Q),
-                             (("R", 0), Thm.dest_arg (Thm.cprop_of th1))] @{thm disjE}
-                          |> fold (fn th' => fn rule => Thm.implies_elim rule th')
+                          (Drule.implies_elim_list
+                            (Drule.infer_instantiate ctxt'
+                              [(("P", 0), cert P), (("Q", 0), cert Q),
+                               (("R", 0), Thm.dest_arg (Thm.cprop_of th1))] @{thm disjE})
                             [th, Thm.implies_intr cP th1, Thm.implies_intr cQ th2])
                     | _ => NONE)
                   end
@@ -927,7 +917,8 @@ fun tidy ctxt derivation =
             fun with_facts [] known go_on = go_on known
               | with_facts ((Kernel.Or branches, th) :: more) known go_on =
                   cases th branches (fn (branch, th') =>
-                    with_facts ((branch ~~ conj_elims (length branch) th') @ more) known go_on)
+                    with_facts ((branch ~~ Concept_Package.conjuncts (length branch) th') @ more)
+                      known go_on)
               | with_facts (held :: more) known go_on = with_facts more (held :: known) go_on;
 
             fun disj_intro rule (P, Q) th =
