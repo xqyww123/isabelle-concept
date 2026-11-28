@@ -75,7 +75,8 @@ struct
 datatype ('a, 'c) premise = Subgoal of 'a | Condition of 'c;
 
 (*a rule on a goal.  premises: in their order, a goal with whether it stays at the distance of
-  the goal of the rule; user: a rule that counts for the limit on user rules*)
+  the goal of the rule; user: a user rule: its step counts for the limit on user rules where it
+  leaves a condition*)
 type ('g, 'r, 'c) step =
  {rule: 'r, premises: ('g * bool, 'c) premise list, leap: int, user: bool};
 
@@ -109,8 +110,9 @@ exception WAIT of int * int;
 exception ASIDE;
 
 (*key: goals of one key are one goal to the table; steps: in the order in which they are tried;
-  user_rule: called for every step of a user rule that a branch takes; solved: called when a
-  goal is first solved without conditions, with what gives its solutions then and later;
+  user_rule: called for every step of a user rule that a branch takes and that leaves a
+  condition; solved: called when a goal is first solved without conditions, with what gives its
+  solutions then and later;
   simplify: of a condition as a rule leaves it, the condition as it is given to the user;
   as_written: the same without any work*)
 type ('g, 'w, 'r, 'c, 's) problem =
@@ -567,7 +569,7 @@ fun search_told (problem: ('g, 'w, 'r, 'c, 's) problem) (limits: limits)
             else if not (null goals) andalso steps + dist >= max_search_distance then ()
             else if eff' >= max_leaps then ()
             else
-             (if user then user_rule () else ();
+             (if user andalso conditional then user_rule () else ();
               push
                {eff = eff', ncond = if conditional then ncond + 1 else ncond,
                 nrules = nrules + 1,
@@ -1007,9 +1009,9 @@ type level = {id: serial, dist: int, steps: int, under_way: (term * (int * int))
   by: that search; thm: of the form of the goal, made when it is first used*)
 type proved = {prems: term list, by: serial, thm: thm lazy};
 
-(*used, limit: of the steps of user rules, in all the searches of one call from outside;
-  proved: what they have proved without conditions, by the forms of the goals, the earliest
-  first; levels: of the searches around, the innermost first*)
+(*used, limit: of the steps of user rules that leave a condition, in all the searches of one
+  call from outside; proved: what they have proved without conditions, by the forms of the
+  goals, the earliest first; levels: of the searches around, the innermost first*)
 structure Around = Proof_Data
 (
   type T =
@@ -1054,8 +1056,8 @@ fun run {max_leaps = leaps, unconditional} ctxt0 prop =
           in if member (op aconv) (Thm.hyps_of prem) t then SOME t else NONE end);
       (*The context of this search, also for the theorems that are made of it later: without
         what the searches around tell, which holds only while they stand where they stood.  A
-        unit of the selector Simpset that does not give its result has used no user rule and
-        proved nothing, unless a search that gives up ends it*)
+        unit of the selector Simpset that does not give its result has counted no user rule
+        and proved nothing, unless a search that gives up ends it*)
       val ctxt =
         Around.put NONE ctxt0
         |> is_none around ? Concept_Type.restoring (fn () =>
